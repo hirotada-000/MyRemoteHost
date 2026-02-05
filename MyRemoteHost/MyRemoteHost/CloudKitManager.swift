@@ -1,0 +1,82 @@
+//
+//  CloudKitManager.swift
+//  MyRemoteHost
+//
+//  CloudKit経由でuserRecordIDを取得し、同じApple IDかどうかを判定
+//  Phase 3: Apple ID認証
+//
+
+import Foundation
+import CloudKit
+
+/// CloudKit経由でApple ID判定を行うマネージャー
+actor CloudKitManager {
+    
+    static let shared = CloudKitManager()
+    
+    // MARK: - Properties
+    
+    /// キャッシュされたuserRecordID
+    private var cachedUserRecordID: String?
+    
+    /// CloudKit Container ID（両プラットフォームで同じIDを使用）
+    private let containerID = "iCloud.com.myremotehost.shared"
+    
+    // MARK: - Public Methods
+    
+    /// 現在のユーザーのuserRecordIDを取得
+    func fetchUserRecordID() async throws -> String {
+        if let cached = cachedUserRecordID {
+            return cached
+        }
+        
+        let container = CKContainer(identifier: containerID)
+        
+        let status = try await container.accountStatus()
+        guard status == .available else {
+            throw CloudKitError.notLoggedIn
+        }
+        
+        let recordID = try await container.userRecordID()
+        let userID = recordID.recordName
+        
+        cachedUserRecordID = userID
+        print("[CloudKitManager] userRecordID取得成功: \(userID.prefix(20))...")
+        
+        return userID
+    }
+    
+    /// userRecordIDが一致するか確認
+    func isSameAppleID(as otherUserRecordID: String) async -> Bool {
+        do {
+            let myID = try await fetchUserRecordID()
+            return myID == otherUserRecordID
+        } catch {
+            print("[CloudKitManager] Apple ID比較失敗: \(error)")
+            return false
+        }
+    }
+    
+    /// キャッシュをクリア
+    func clearCache() {
+        cachedUserRecordID = nil
+    }
+    
+    // MARK: - Errors
+    
+    enum CloudKitError: Error, LocalizedError {
+        case notLoggedIn
+        case fetchFailed(Error)
+        
+        var errorDescription: String? {
+            switch self {
+            case .notLoggedIn:
+                return "iCloudにログインしていません"
+            case .fetchFailed(let error):
+                return "userRecordID取得失敗: \(error.localizedDescription)"
+            }
+        }
+    }
+}
+
+
