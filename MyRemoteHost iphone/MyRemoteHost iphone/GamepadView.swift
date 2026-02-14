@@ -36,31 +36,99 @@ struct GamepadView: View {
                 
                 // ★ ステータスバー（常時表示）
                 statusBar
+                
+                // ★ Phase 2: 全知全能HUD (Omniscient HUD)
+                if viewModel.showHUD, let state = viewModel.currentOmniscientState {
+                    VStack {
+                        OmniscientHUD(state: state)
+                            .padding(.top, 60) // ステータスバーの下
+                        Spacer()
+                    }
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .zIndex(100) // 最前面
+                    .allowsHitTesting(false) // 操作を邪魔しない
+                }
             }
         }
         .background(Color.black)
         .ignoresSafeArea()
     }
     
-    // MARK: - Full Screen Preview
+    // MARK: - Full Screen Preview (ROI-Only Zoom)
+    
+    /// 仮想ズーム倍率（表示は1:1のまま、macOS側のキャプチャ領域のみ変更）
+    @State private var virtualZoom: CGFloat = 1.0
+    @State private var lastPinchScale: CGFloat = 1.0
+    
+    /// 仮想パン位置（正規化座標 0〜1）
+    @State private var virtualOffset: CGSize = .zero
+    @State private var lastDragOffset: CGSize = .zero
     
     private func fullScreenPreview(geometry: GeometryProxy) -> some View {
-        ZoomableScrollView(
-            minZoom: 1.0,
-            maxZoom: 5.0,
-            onZoomChanged: { scale, visibleRect in
-                viewModel.updateZoomState(scale: scale, visibleRect: visibleRect)
+        // 常に1:1でプレビュー表示（ローカルズームなし）
+        CoordinatedPreviewView(coordinator: viewModel.previewCoordinator)
+            .frame(width: geometry.size.width, height: geometry.size.height)
+            .contentShape(Rectangle())
+            // ピンチ → 仮想ズーム（macOS ROI制御のみ）
+            .gesture(
+                MagnificationGesture()
+                    .onChanged { value in
+                        let newScale = max(1.0, min(5.0, lastPinchScale * value))
+                        virtualZoom = newScale
+                        sendROIRequest()
+                    }
+                    .onEnded { value in
+                        lastPinchScale = virtualZoom
+                        if virtualZoom < 1.1 {
+                            // ほぼ等倍 → リセット
+                            virtualZoom = 1.0
+                            lastPinchScale = 1.0
+                            virtualOffset = .zero
+                            lastDragOffset = .zero
+                            sendROIRequest()
+                        }
+                    }
+            )
+            // ドラッグ → 仮想パン（ズーム中のみ）
+            .simultaneousGesture(
+                DragGesture()
+                    .onChanged { value in
+                        guard virtualZoom > 1.1 else { return }
+                        let sensitivity: CGFloat = 1.0 / (geometry.size.width * virtualZoom)
+                        let dx = lastDragOffset.width - value.translation.width * sensitivity
+                        let dy = lastDragOffset.height - value.translation.height * sensitivity
+                        virtualOffset = CGSize(
+                            width: max(0, min(1.0 - 1.0 / virtualZoom, dx)),
+                            height: max(0, min(1.0 - 1.0 / virtualZoom, dy))
+                        )
+                        sendROIRequest()
+                    }
+                    .onEnded { _ in
+                        lastDragOffset = virtualOffset
+                    }
+            )
+            .onTapGesture(count: 3) {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    showControls.toggle()
+                }
             }
-        ) {
-            CoordinatedPreviewView(coordinator: viewModel.previewCoordinator)
-                .frame(width: geometry.size.width, height: geometry.size.height)
-        }
-        .onTapGesture(count: 3) {
-            // 3回タップでコントローラー表示切り替え
-            withAnimation(.easeInOut(duration: 0.2)) {
-                showControls.toggle()
+            // ダブルタップ → ズームイン/リセット
+            .onTapGesture(count: 2) {
+                if virtualZoom > 1.1 {
+                    // リセット
+                    virtualZoom = 1.0
+                    lastPinchScale = 1.0
+                    virtualOffset = .zero
+                    lastDragOffset = .zero
+                } else {
+                    // 2.5倍ズーム（中央）
+                    virtualZoom = 2.5
+                    lastPinchScale = 2.5
+                    virtualOffset = CGSize(width: 0.3, height: 0.3)
+                    lastDragOffset = virtualOffset
+                }
+                sendROIRequest()
             }
-        }
     }
     
     // MARK: - Controls Overlay
@@ -131,9 +199,9 @@ struct GamepadView: View {
                         .fontWeight(.medium)
                         .foregroundColor(.white.opacity(0.9))
                     
-                    // ★ ズーム倍率（1.5x以上で表示）
-                    if viewModel.zoomScale > 1.4 {
-                        Text("\(String(format: "%.1f", viewModel.zoomScale))x")
+                    // ★ ROIズーム倍率（1.5x以上で表示）
+                    if virtualZoom > 1.4 {
+                        Text("ROI \(String(format: "%.1f", virtualZoom))x")
                             .font(.caption)
                             .fontWeight(.bold)
                             .foregroundColor(.cyan)
@@ -144,25 +212,61 @@ struct GamepadView: View {
                 .background(Color.black.opacity(0.6))
                 .cornerRadius(8)
                 
-                // ★ 切断ボタン
+
+                
+                // ★ Phase 2: HUD切替ボタン
                 Button(action: {
-                    viewModel.disconnect()
-                }) {
-                    HStack(spacing: 4) {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.caption)
-                        Text("切断")
-                            .font(.caption2)
+                    withAnimation(.spring(response: 0.4, dampingFraction: 0.7)) {
+                        viewModel.showHUD.toggle()
                     }
-                    .foregroundColor(.red.opacity(0.9))
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 6)
-                    .background(Color.black.opacity(0.6))
-                    .cornerRadius(8)
+                }) {
+                    Image(systemName: viewModel.showHUD ? "chart.bar.doc.horizontal.fill" : "chart.bar.doc.horizontal")
+                        .foregroundColor(.white)
+                        .padding(8)
+                        .background(Color.black.opacity(0.6))
+                        .cornerRadius(8)
+                }
+                
+                // ★ 切断ボタン (長押しで誤操作防止)
+                if viewModel.isConnected {
+                    Button(action: {
+                        // タップでは何もしない（長押し誘導のトーストを出しても良いが今回は省略）
+                    }) {
+                        Image(systemName: "power")
+                            .font(.headline)
+                            .foregroundColor(.white)
+                            .padding(8)
+                            .background(Color.red.opacity(0.8))
+                            .clipShape(Circle())
+                    }
+                    .simultaneousGesture(
+                        LongPressGesture(minimumDuration: 1.0)
+                            .onEnded { _ in
+                                let generator = UINotificationFeedbackGenerator()
+                                generator.notificationOccurred(.warning)
+                                viewModel.disconnect()
+                            }
+                    )
+                    .overlay(
+                        // 長押しヒント
+                        Text("Hold")
+                            .font(.caption2)
+                            .foregroundColor(.white)
+                            .offset(y: 20)
+                            .opacity(0.8)
+                    )
                 }
             }
             .padding(.horizontal, 12)
             .padding(.top, 8)
+            
+            // HUD Overlay
+            if viewModel.showHUD, let state = viewModel.currentOmniscientState {
+                OmniscientHUD(state: state)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .padding(.top, 4)
+                    .zIndex(1)
+            }
             
             Spacer()
         }
@@ -223,6 +327,18 @@ struct GamepadView: View {
                 .shadow(color: .blue.opacity(0.5), radius: 8, x: 0, y: 2)
             }
         }
+    }
+    // MARK: - ROI Request
+    
+    /// 仮想ズーム＆パン状態からvisibleRectを計算してmacOSに送信
+    private func sendROIRequest() {
+        let w = 1.0 / virtualZoom
+        let h = 1.0 / virtualZoom
+        let x = virtualOffset.width
+        let y = virtualOffset.height
+        let visibleRect = CGRect(x: x, y: y, width: w, height: h)
+        
+        viewModel.updateZoomState(scale: virtualZoom, visibleRect: visibleRect)
     }
 }
 

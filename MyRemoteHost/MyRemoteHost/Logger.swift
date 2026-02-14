@@ -38,6 +38,8 @@ public enum LogCategory: String, Sendable {
     case crypto = "Crypto"
     case video = "Video"
     case connection = "Connection"  // 接続フロー専用
+    case app = "App"  // アプリライフサイクル
+    case pipeline = "Pipeline"  // ★ パイプライン最適化イベント
     
     var emoji: String {
         switch self {
@@ -48,6 +50,8 @@ public enum LogCategory: String, Sendable {
         case .crypto: return "🔐"
         case .video: return "🎬"
         case .connection: return "🚀"
+        case .app: return "📱"
+        case .pipeline: return "⚡"
         }
     }
 }
@@ -179,10 +183,15 @@ public final class Logger: @unchecked Sendable {
     
     // MARK: - Time Formatting
     
-    private func formatTime(_ date: Date) -> String {
+    /// DateFormatter（生成コスト大のため static キャッシュ）
+    private static let timeFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss.SSS"
-        return formatter.string(from: date)
+        return formatter
+    }()
+    
+    private func formatTime(_ date: Date) -> String {
+        return Self.timeFormatter.string(from: date)
     }
     
     // MARK: - Connection Flow Tracking
@@ -334,5 +343,14 @@ public extension Logger {
     
     static func video(_ message: String, level: LogLevel = .info, sampling: SamplingMode = .perSecond) {
         shared.log(message, level: level, category: .video, sampling: sampling)
+    }
+    
+    static func app(_ message: String, level: LogLevel = .info, sampling: SamplingMode = .always) {
+        shared.log(message, level: level, category: .app, sampling: sampling)
+    }
+    
+    /// ★ パイプライン最適化イベント（デフォルト: 10秒スロットリング）
+    static func pipeline(_ message: String, level: LogLevel = .info, sampling: SamplingMode = .throttle(10.0)) {
+        shared.log(message, level: level, category: .pipeline, sampling: sampling)
     }
 }

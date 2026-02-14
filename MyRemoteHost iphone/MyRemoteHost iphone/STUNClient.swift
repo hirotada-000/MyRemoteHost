@@ -95,9 +95,13 @@ public actor STUNClient {
     
     /// 単一のSTUNサーバーにクエリ
     private func querySTUNServer(host: String, port: UInt16) async throws -> STUNResult {
-        // UDPソケット作成
+        // UDPソケット作成（IPv4を強制 — STUNサーバーがIPv6を返さないようにする）
         let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!)
-        let connection = NWConnection(to: endpoint, using: .udp)
+        let params = NWParameters.udp
+        if let ipOptions = params.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
+            ipOptions.version = .v4
+        }
+        let connection = NWConnection(to: endpoint, using: params)
         
         return try await withCheckedThrowingContinuation { continuation in
             var hasResumed = false
@@ -250,8 +254,9 @@ public actor STUNClient {
                 if let result = parseXorMappedAddress(data: data, offset: offset, length: attrLength) {
                     publicIP = result.0
                     publicPort = result.1
-                    break
+                    break  // IPv4取得成功
                 }
+                // IPv6の場合はnilが返るので、MAPPED-ADDRESSを探し続ける
             } else if attrType == STUNAttributeType.mappedAddress.rawValue {
                 // MAPPED-ADDRESS（フォールバック）
                 if let result = parseMappedAddress(data: data, offset: offset, length: attrLength) {
@@ -293,6 +298,10 @@ public actor STUNClient {
             let ip = xorIP ^ stunMagicCookie
             let ipString = "\(ip >> 24 & 0xFF).\(ip >> 16 & 0xFF).\(ip >> 8 & 0xFF).\(ip & 0xFF)"
             return (ipString, port)
+        } else if family == 0x02 {
+            // IPv6 - NAT越えにはIPv4が必要なのでスキップ
+            Logger.stun("ℹ️ XOR-MAPPED-ADDRESS: IPv6検出 - IPv4を探します", level: .warning)
+            return nil
         }
         
         return nil
@@ -309,6 +318,9 @@ public actor STUNClient {
             // IPv4
             let ip = "\(data[offset + 4]).\(data[offset + 5]).\(data[offset + 6]).\(data[offset + 7])"
             return (ip, port)
+        } else if family == 0x02 {
+            // IPv6 - スキップ
+            return nil
         }
         
         return nil

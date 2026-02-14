@@ -30,8 +30,10 @@ protocol NetworkReceiverDelegate: AnyObject {
     /// 認証結果を受信
     func networkReceiver(_ receiver: NetworkReceiver, didReceiveAuthResult approved: Bool)
     
-    /// ★ PNG 静止画フレームを受信
-    func networkReceiver(_ receiver: NetworkReceiver, didReceivePNG data: Data)
+    /// OmniscientStateを受信
+    func networkReceiver(_ receiver: NetworkReceiver, didReceiveOmniscientState state: OmniscientState)
+    
+
 }
 
 /// UDP映像受信クラス（リスナーモード）
@@ -54,10 +56,11 @@ class NetworkReceiver {
         case pps = 0x02
         case videoFrame = 0x03
         case keyFrame = 0x04
-        case jpegFrame = 0x05  // Deprecated
-        case pngFrame = 0x06   // ★ PNG フレーム
+
         case fecParity = 0x07  // ★ Phase 2: FECパリティ
         case metadata = 0x08   // ★ Phase 4: メタデータ
+        case handshake = 0x09  // ★ Phase 4: ECDHハンドシェイク
+        case omniscientState = 0x50 // ★ Phase 2: 全知全能ステート送信
     }
     
     // MARK: - Properties
@@ -95,13 +98,17 @@ class NetworkReceiver {
     
     /// ★ フレームタイムアウト（ms）- この時間内に揃わなければスキップ
     /// PNG画像(数MB・1600+パケット)の転送時間を考慮して大幅に延長
-    private let frameTimeoutMs: UInt64 = 5000  // ★ 5秒（超強化ペーシング対応）
+    /// TURN経由では遅延が大きいため動的に調整
+    private var frameTimeoutMs: UInt64 = 200  // ★ Phase 3: フレームタイムアウト（200ms — TURN時は2000ms）
     
     /// ★ フレーム開始時刻（タイムアウト用）
     private var frameStartTimes: [UInt64: UInt64] = [:]
     
     /// ★ スキップされたフレーム数（デバッグ用）
     private var skippedFrameCount: Int = 0
+    
+    /// ★ Phase 3: 連続タイムアウトカウンタ（キーフレーム自動要求用）
+    private var consecutiveTimeoutCount: Int = 0
     
     /// ★ Phase 3: userRecordIDキャッシュ（Apple ID認証用）
     private(set) var cachedUserRecordID: String?  // ★ 外部から読み取り可能に
@@ -110,13 +117,13 @@ class NetworkReceiver {
     private let fecDecoder = FECDecoder()
     
     /// ★ Phase 2: FEC有効化フラグ
-    var fecEnabled: Bool = false  // ★ 一時無効化: デバッグ用
+    var fecEnabled: Bool = true
     
     /// ★ Phase 3: 暗号化マネージャー
     let cryptoManager = CryptoManager()
     
     /// ★ Phase 3: 暗号化有効化フラグ
-    var encryptionEnabled: Bool = false  // ★ 一時無効化: 鍵交換未実装のため
+    var encryptionEnabled: Bool = true
     
     // MARK: - ログ頻度制御
     
@@ -167,6 +174,23 @@ class NetworkReceiver {
             }
             return result
         }
+        
+        // ★ Phase 2.5: 欠落チャンクの文字列表現（例: "0, 1, 5-10"）
+        var missingChunksString: String {
+            var missing: [Int] = []
+            for i in 0..<totalPackets {
+                if receivedPackets[i] == nil {
+                    missing.append(i)
+                }
+            }
+            
+            // 簡易的な範囲圧縮（数が多い場合に見やすくする）
+            if missing.isEmpty { return "None" }
+            if missing.count > 20 {
+                return "\(missing.prefix(10).map(String.init).joined(separator: ",")) ... (Total \(missing.count) missing)"
+            }
+            return missing.map(String.init).joined(separator: ",")
+        }
     }
     
     // MARK: - Initialization
@@ -183,7 +207,7 @@ class NetworkReceiver {
         // 既に接続中または接続処理中なら無視
         switch state {
         case .connecting, .listening, .receiving:
-            // print("[NetworkReceiver] ⚠️ 既に接続中または接続処理中 - 無視")
+            Logger.network("⚠️ 既に接続中または接続処理中 - 無視")
             return
         case .disconnected, .failed:
             break  // 接続可能
@@ -207,7 +231,7 @@ class NetworkReceiver {
             try startListening()
         } catch {
             state = .failed(error)
-            // print("[NetworkReceiver] リスナー起動失敗: \(error)")
+            Logger.network("❌ リスナー起動失敗: \(error)")
             return
         }
         
@@ -227,6 +251,10 @@ class NetworkReceiver {
                 // 接続確立 → 自分のリッスンポートを送信
                 self.sendRegistration()
                 self.scheduleHeartbeat()
+                
+                // ★ TCPからもデータ受信待ちを開始（認証結果 0xAA を受信するため）
+                self.startReceiving(self.serverConnection!)
+                
                 Logger.network("✅ サーバー接続完了: \(host):\(port)")
                 
             case .failed(let error):
@@ -242,6 +270,34 @@ class NetworkReceiver {
         }
         
         serverConnection?.start(queue: receiveQueue)
+    }
+    
+    // MARK: - TURN Relay Support
+    
+    /// ★ Step 2: TURN接続モードフラグ
+    /// TURN relay経由の場合、TCP登録やUDPリスナーではなくTURN経由でデータを送受信
+    private(set) var isTURNMode: Bool = false
+    
+    /// ★ Step 2: TURN relay経由で受信したデータを既存パイプラインに注入
+    /// TURNClient.onDataReceived → この関数 → processPacket()
+    func injectTURNData(_ data: Data) {
+        receiveQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.processPacket(data)
+        }
+    }
+    
+    /// ★ Step 2: TURNモードでの接続開始
+    /// 直接TCP/UDP接続の代わりにTURN relay経由で通信する
+    func connectViaTURN() {
+        isTURNMode = true
+        state = .receiving
+        // ★ TURN経由はネットワーク遅延が大きいためタイムアウトを緩和
+        frameTimeoutMs = 2000
+        Logger.network("🔄 TURN relayモード: データ注入待機中 (timeout=\(frameTimeoutMs)ms)")
+        
+        // TURN経由ではTCP登録パケットを送らない
+        // 代わりにCloudKit経由でMacに存在を通知する
     }
     
     /// 切断
@@ -265,6 +321,19 @@ class NetworkReceiver {
                 // print("[NetworkReceiver] 切断通知エラー: \(error)")
             } else {
                 // print("[NetworkReceiver] 切断通知送信完了")
+            }
+        })
+    }
+    
+    /// ★ Phase 3: キーフレーム自動要求（連続ロス時）
+    private func requestKeyFrame() {
+        // キーフレーム要求パケット: [0xFC]
+        var packet = Data()
+        packet.append(0xFC)
+        
+        serverConnection?.send(content: packet, completion: .contentProcessed { error in
+            if error == nil {
+                Logger.pipeline("★ キーフレーム自動要求送信")
             }
         })
     }
@@ -325,9 +394,11 @@ class NetworkReceiver {
         
         // 既に同じエンドポイントからの接続があれば再利用
         if connections[key] != nil {
+            Logger.network("🔄 既存UDP接続再利用: \(key)")
             return
         }
         
+        Logger.network("🆕 新規UDP接続: \(key), 接続数: \(connections.count + 1)")
         connections[key] = connection
         
         connection.stateUpdateHandler = { [weak self] newState in
@@ -367,14 +438,13 @@ class NetworkReceiver {
             packet.append(Data(userRecordID.utf8))
         }
         
-        Logger.network("📤 登録パケット送信: \(packet.count)バイト")  // ★ デバッグログ
+        Logger.network("📤 登録パケット送信: \(packet.count)バイト", sampling: .oncePerSession)  // 初回のみ
         
         serverConnection?.send(content: packet, completion: .contentProcessed { error in
             if let error = error {
                 Logger.network("❌ 登録送信エラー: \(error)", level: .error)
-            } else {
-                Logger.network("✅ 登録パケット送信成功")
             }
+            // 成功ログは冗長なため削除
         })
     }
     
@@ -416,18 +486,24 @@ class NetworkReceiver {
             guard let self = self else { return }
             
             if let error = error {
-                // print("[NetworkReceiver] 受信エラー: \(error)")
+                Logger.network("❌ UDP受信エラー: \(error)", level: .error)
                 self.delegate?.networkReceiver(self, didFailWithError: error)
                 return
             }
             
             if let data = content {
+                // ★ 診断ログ: パケット受信確認
+                if data.count >= 1 {
+                    let typeByte = data[0]
+                    Logger.network("📥 UDP受信: \(data.count)bytes, type=0x\(String(format: "%02X", typeByte))", sampling: .perSecond)
+                }
                 self.processPacket(data)
+            } else {
+                Logger.network("⚠️ UDP受信: contentがnil", level: .warning)
             }
             
             // UDP では各データグラムが isComplete=true を返すが、
             // エラーがない限り常に次のパケットを待機する
-            // （接続がキャンセルされた場合は self が nil になるか error が返る）
             self.receivePacket(on: connection)
         }
     }
@@ -465,15 +541,15 @@ class NetworkReceiver {
         }
         
         let timestamp = data.subdata(in: 1..<9).withUnsafeBytes {
-            UInt64(bigEndian: $0.load(as: UInt64.self))
+            UInt64(bigEndian: $0.loadUnaligned(fromByteOffset: 0, as: UInt64.self))
         }
         
         let totalPackets = data.subdata(in: 9..<13).withUnsafeBytes {
-            Int(UInt32(bigEndian: $0.load(as: UInt32.self)))
+            Int(UInt32(bigEndian: $0.loadUnaligned(fromByteOffset: 0, as: UInt32.self)))
         }
         
         let packetIndex = data.subdata(in: 13..<17).withUnsafeBytes {
-            Int(UInt32(bigEndian: $0.load(as: UInt32.self)))
+            Int(UInt32(bigEndian: $0.loadUnaligned(fromByteOffset: 0, as: UInt32.self)))
         }
         
         let payload = data.subdata(in: 17..<data.count)
@@ -481,37 +557,46 @@ class NetworkReceiver {
         // ═══════════════════════════════════════════
         // ★ パケットロス無視戦略: 古いフレームは即座に破棄
         // ═══════════════════════════════════════════
-        // SPS/PPS/VPS/PNGは常に受け入れる（デコーダ初期化・静止画品質に必要）
-        if packetType == .vps || packetType == .sps || packetType == .pps || packetType == .pngFrame {
-            if packetType == .pngFrame {
-                // ★ PNGパケット到達確認ログ (パケット番号1のみ)
-                if packetIndex == 0 {
-                    // print("[NetworkReceiver] 📨 PNGパケット受信開始: ID=\(timestamp), Total=\(totalPackets)")
-                }
-            }
-            
-            // ★ PNGは複数パケットに分割される可能性があるため、再構築処理に進む
-            if packetType == .pngFrame && totalPackets > 1 {
-                // 複数パケットの場合は再構築処理へ（下のコードで処理）
-            } else {
-                deliverFrame(type: packetType, data: payload, timestamp: timestamp)
+        // SPS/PPS/VPSは常に受け入れる（デコーダ初期化に必要）
+        // SPS/PPS/VPSは常に受け入れる（デコーダ初期化に必要）
+        if packetType == .vps || packetType == .sps || packetType == .pps {
+            // ★ Phase 4: 復号 (パラメータセットも暗号化されている)
+            guard let finalData = cryptoManager.decryptIfEnabled(payload) else {
+                Logger.network("⚠️ パラメータセット復号失敗 type=\(packetType) size=\(payload.count)", level: .error)
                 return
             }
+            Logger.network("✅ パラメータセット受信: type=\(packetType) size=\(finalData.count)", sampling: .oncePerSession)
+            deliverFrame(type: packetType, data: finalData, timestamp: timestamp)
+            return
         }
         
-        // 古いフレームは即破棄（しきい値判定 - 1秒以上古い場合のみ）
-        // ★ PNGは静止画なので古いフレームチェックをスキップ
-        if packetType != .pngFrame && isOlderFrame(timestamp, than: latestFrameId) {
+        // 古いフレームは即破棄（しきい値判定 - 200ms以上古い場合のみ）
+        // ★ ただし、以下は古いフレーム判定から除外して保護:
+        //    1. キーフレーム: デコード再開に必須、TURN経由では大幅に遅延する可能性あり
+        //    2. 既にAssemblerが存在する: 分割受信中のフレーム（後続チャンク到着待ち）
+        let isProtected = (packetType == .keyFrame) || (packetBuffer[timestamp] != nil)
+        
+        // ★ Phase 0 診断: パケット到着ログ（KF/PF両方）
+        if packetType == .keyFrame {
+            Logger.network("🔑 KFチャンク受信: \(packetIndex)/\(totalPackets) ts=\(timestamp) protected=\(isProtected)")
+        } else if packetType == .videoFrame {
+            Logger.network("🎬 PFチャンク受信: \(packetIndex)/\(totalPackets) ts=\(timestamp) size=\(payload.count)", sampling: .throttle(1.0))
+        }
+        
+        if isOlderFrame(timestamp, than: latestFrameId) && !isProtected {
             skippedFrameCount += 1
-            // ★ ログ抑制: 10000件ごとのみ出力
-            if skippedFrameCount % 10000 == 0 {
-                // print("[NetworkReceiver] 古いフレームスキップ: 累計\(skippedFrameCount)フレーム")
+            // ★ 診断: P-frameが古いフレーム判定でドロップされた場合にログ
+            if packetType == .videoFrame && skippedFrameCount <= 10 {
+                Logger.network("⚠️ PF古いフレームドロップ: ts=\(timestamp) latest=\(latestFrameId) diff=\(latestFrameId - timestamp)", level: .warning)
             }
             return
         }
         
         // 最新フレームID更新（パケット破棄はしない - 並行受信を許可）
-        if timestamp > latestFrameId {
+        // ★ Phase 2: キーフレーム再構築中はlatestFrameId更新を凍結
+        //   キーフレームAssemblerが存在する間、P-frameがlatestFrameIdを進めるのを防止
+        let hasKeyFrameAssembler = packetBuffer.values.contains { $0.packetType == .keyFrame }
+        if timestamp > latestFrameId && !hasKeyFrameAssembler {
             latestFrameId = timestamp
             // 定期クリーンアップ（新しいフレームID検知時に実行）
             cleanupOldBuffers(currentTimestamp: timestamp)
@@ -519,7 +604,17 @@ class NetworkReceiver {
         
         // 単一パケットの場合は即座に処理
         if totalPackets == 1 {
-            deliverFrame(type: packetType, data: payload, timestamp: timestamp)
+            // ★ Phase 4: 復号 (ハンドシェイク以外)
+            var finalData = payload
+            if packetType != .handshake {
+                guard let decrypted = cryptoManager.decryptIfEnabled(payload) else {
+                    print("[NetworkReceiver] ⚠️ 単一パケット復号失敗 → 破棄")
+                    return
+                }
+                finalData = decrypted
+                // if finalData.count != payload.count { print("🔓 Decrypted: \(payload.count) -> \(finalData.count) bytes") }
+            }
+            deliverFrame(type: packetType, data: finalData, timestamp: timestamp)
             return
         }
         
@@ -527,31 +622,40 @@ class NetworkReceiver {
         let key = timestamp
         
         if packetBuffer[key] == nil {
-            // print("[NetworkReceiver] 🧩 新規Assembler作成: ID=\(key), Type=\(packetType), Total=\(totalPackets)")
+            // ★ Phase 0 診断: キーフレーム用Assembler作成ログ
+            if packetType == .keyFrame {
+                Logger.network("🔑 KF Assembler作成: ts=\(key), total=\(totalPackets)チャンク")
+            }
             packetBuffer[key] = PacketAssembler(totalPackets: totalPackets, packetType: packetType)
             frameStartTimes[key] = currentTimeMs()  // タイムアウト計測開始
         }
         
         packetBuffer[key]?.addPacket(index: packetIndex, data: payload)
         
-        // ★ PNG再構築デバッグログ
-        if let assembler = packetBuffer[key], assembler.packetType == .pngFrame {
-            let receivedCount = assembler.receivedCount
-            let totalCount = totalPackets
-            // 100パケットごとにログ出力
-            if receivedCount == 1 || receivedCount % 100 == 0 || receivedCount == Int(totalCount) {
-                // print("[NetworkReceiver] 📦 PNG再構築(\(key)): \(receivedCount)/\(totalCount) パケット受信")
-            }
-        }
-        
         // 全パケット揃った場合
         if let assembler = packetBuffer[key], assembler.isComplete {
             let frameType = assembler.packetType  // ★ 保存したタイプを使用
+            
+            // ★ Phase 0 診断: キーフレーム再構築完了ログ
+            if frameType == .keyFrame {
+                Logger.network("🔑🎉 KF再構築完了! ts=\(key), total=\(totalPackets)チャンク")
+            }
+            
             if let assembledData = assembler.assemble() {
-                if frameType == .pngFrame {
-                    // print("[NetworkReceiver] ✅ PNG再構築完了: \(assembledData.count)バイト -> deliverFrameへ")
+                
+                // ★ Phase 4: 復号 (組み立て後)
+                var finalData = assembledData
+                if frameType != .handshake {
+                    guard let decrypted = cryptoManager.decryptIfEnabled(assembledData) else {
+                        print("[NetworkReceiver] ⚠️ 組み立て済みフレーム復号失敗 → 破棄")
+                        packetBuffer.removeValue(forKey: key)
+                        frameStartTimes.removeValue(forKey: key)
+                        return
+                    }
+                    finalData = decrypted
+                    // if finalData.count != assembledData.count { print("🔓 Decrypted(Assembled): \(assembledData.count) -> \(finalData.count) bytes") }
                 }
-                deliverFrame(type: frameType, data: assembledData, timestamp: timestamp)
+                deliverFrame(type: frameType, data: finalData, timestamp: timestamp)
             }
             packetBuffer.removeValue(forKey: key)
             frameStartTimes.removeValue(forKey: key)
@@ -566,17 +670,25 @@ class NetworkReceiver {
                 packetBuffer.removeValue(forKey: key)
                 frameStartTimes.removeValue(forKey: key)
                 skippedFrameCount += 1
+                consecutiveTimeoutCount += 1
+                
+                // ★ Phase 3: 連続タイムアウト時はキーフレーム自動要求
+                if consecutiveTimeoutCount >= 5 {
+                    requestKeyFrame()
+                    consecutiveTimeoutCount = 0
+                }
             }
         }
     }
     
-    /// ★ 古いフレームかどうか判定（ラップアラウンド対応）
+    /// ★ 最適化 3-A: 古いフレーム判定（TURN時はjitter許容を拡大）
     private func isOlderFrame(_ id: UInt64, than latest: UInt64) -> Bool {
-        // タイムスタンプベース
         if id < latest {
             let diff = latest - id
-            // 1秒以上古い場合は「古い」と判定（1秒以内の遅延・並行受信は許容）
-            return diff > 1_000_000_000
+            // TURN経由ではパケット到着ジッターが大きいため、
+            // 有効フレームの過剰ドロップを防止（200ms→500ms）
+            let thresholdNs: UInt64 = isTURNMode ? 500_000_000 : 200_000_000
+            return diff > thresholdNs
         }
         return false
     }
@@ -587,66 +699,113 @@ class NetworkReceiver {
     }
     
     private func deliverFrame(type: PacketType, data: Data, timestamp: UInt64) {
+        // ★ Phase 3: 正常フレーム受信でタイムアウトカウンタリセット
+        consecutiveTimeoutCount = 0
         DispatchQueue.main.async {
-            switch type {
-            case .vps:
-                if !self.hasLoggedParameterSets {
-                    // print("[NetworkReceiver] HEVC VPS受信: \(data.count)バイト")
-                }
-                self.delegate?.networkReceiver(self, didReceiveVPS: data)
-            case .sps:
-                if !self.hasLoggedParameterSets {
-                    // print("[NetworkReceiver] SPS受信: \(data.count)バイト")
-                }
-                self.delegate?.networkReceiver(self, didReceiveSPS: data)
-            case .pps:
-                if !self.hasLoggedParameterSets {
-                    // print("[NetworkReceiver] PPS受信: \(data.count)バイト")
-                    self.hasLoggedParameterSets = true
-                }
-                self.delegate?.networkReceiver(self, didReceivePPS: data)
-            case .videoFrame:
-                self.delegate?.networkReceiver(self, didReceiveVideoFrame: data, isKeyFrame: false, timestamp: timestamp)
-            case .keyFrame:
-                self.keyFrameReceiveCount += 1
-                if self.keyFrameReceiveCount == 1 || self.keyFrameReceiveCount % 100 == 0 {
-                    // print("[NetworkReceiver] キーフレーム受信: \(data.count)バイト (累計\(self.keyFrameReceiveCount)回)")
-                }
-                self.delegate?.networkReceiver(self, didReceiveVideoFrame: data, isKeyFrame: true, timestamp: timestamp)
-            case .jpegFrame:
-                if !self.hasLoggedOldJpeg {
-                    // print("[NetworkReceiver] 旧JPEGフレーム受信(無視) - 今後ログ抜制")
-                    self.hasLoggedOldJpeg = true
-                }
-            case .pngFrame:
-                self.pngReceiveCount += 1
-                if self.pngReceiveCount == 1 || self.pngReceiveCount % 100 == 0 {
-                    // print("[NetworkReceiver] PNG静止画フレーム受信: \(data.count)バイト (累計\(self.pngReceiveCount)回)")
-                }
-                self.delegate?.networkReceiver(self, didReceivePNG: data)
-            case .fecParity:
-                break
-            case .metadata:
-                self.metadataReceiveCount += 1
-                if self.metadataReceiveCount == 1 || self.metadataReceiveCount % 100 == 0 {
-                    // print("[NetworkReceiver] メタデータ受信: \(data.count)バイト (累計\(self.metadataReceiveCount)回)")
-                }
+            self.handlePacketOnMain(type: type, data: data, timestamp: timestamp)
+        }
+    }
+    
+    private func handlePacketOnMain(type: PacketType, data: Data, timestamp: UInt64) {
+        switch type {
+        case .vps:
+            if !self.hasLoggedParameterSets {
+                // print("[NetworkReceiver] HEVC VPS受信: \(data.count)バイト")
+            }
+            self.delegate?.networkReceiver(self, didReceiveVPS: data)
+        case .sps:
+            if !self.hasLoggedParameterSets {
+                // print("[NetworkReceiver] SPS受信: \(data.count)バイト")
+            }
+            self.delegate?.networkReceiver(self, didReceiveSPS: data)
+        case .pps:
+            if !self.hasLoggedParameterSets {
+                // print("[NetworkReceiver] PPS受信: \(data.count)バイト")
+                self.hasLoggedParameterSets = true
+            }
+            self.delegate?.networkReceiver(self, didReceivePPS: data)
+        case .videoFrame:
+            self.delegate?.networkReceiver(self, didReceiveVideoFrame: data, isKeyFrame: false, timestamp: timestamp)
+        case .keyFrame:
+            self.keyFrameReceiveCount += 1
+            if self.keyFrameReceiveCount == 1 || self.keyFrameReceiveCount % 100 == 0 {
+                // print("[NetworkReceiver] キーフレーム受信: \(data.count)バイト (累計\(self.keyFrameReceiveCount)回)")
+            }
+            self.delegate?.networkReceiver(self, didReceiveVideoFrame: data, isKeyFrame: true, timestamp: timestamp)
+
+        case .fecParity:
+            break
+        case .metadata:
+            self.metadataReceiveCount += 1
+            if self.metadataReceiveCount == 1 || self.metadataReceiveCount % 100 == 0 {
+                // print("[NetworkReceiver] メタデータ受信: \(data.count)バイト (累計\(self.metadataReceiveCount)回)")
+            }
+        case .handshake:
+            do {
+                Logger.network("🔐 ハンドシェイク受信(Server->Client): \(data.count) bytes")
+                
+                // 1. 自分の鍵ペアを生成 (0xEC + PubKey)
+                let myHandshakePayload = self.cryptoManager.generateECDHHandshakePacket()
+                
+                // 2. 相手の鍵で共有鍵を生成 (0xECチェック含む)
+                try self.cryptoManager.processECDHHandshake(data)
+                Logger.network("✅ E2E暗号化接続 確立完了 (Client)")
+                
+                // 3. 自分の公開鍵を返信
+                 for (_, conn) in self.connections {
+                     self.sendHandshake(myHandshakePayload, to: conn)
+                 }
+                
+            } catch {
+                Logger.network("❌ ハンドシェイク失敗: \(error)", level: .error)
+            }
+        case .omniscientState:
+            do {
+                let state = try JSONDecoder().decode(OmniscientState.self, from: data)
+                self.delegate?.networkReceiver(self, didReceiveOmniscientState: state)
+            } catch {
+                Logger.network("⚠️ OmniscientStateデコード失敗: \(error)", level: .warning)
             }
         }
+    }
+    
+    /// ★ Phase 4: ハンドシェイク返信 (Client->Server)
+    private func sendHandshake(_ payload: Data, to connection: NWConnection) {
+        Logger.network("🔐 ハンドシェイク送信(Client->Server): \(payload.count)バイト")
+        
+        // ヘッダー作成
+        var packet = Data()
+        packet.append(PacketType.handshake.rawValue)
+        var ts: UInt64 = 0
+        packet.append(Data(bytes: &ts, count: 8))
+        var total: UInt32 = 1
+        packet.append(contentsOf: Data(bytes: &total, count: 4).reversed())
+        var index: UInt32 = 0
+        packet.append(contentsOf: Data(bytes: &index, count: 4).reversed())
+        
+        packet.append(payload) // 既に 0xEC 付き
+        
+        connection.send(content: packet, completion: .contentProcessed { _ in })
     }
     
     private func cleanupOldBuffers(currentTimestamp: UInt64) {
         // 1秒以上古いバッファを削除
         let threshold: UInt64 = 1_000_000_000 // 1秒（ナノ秒）
+        // ★ Phase 2: キーフレームAssemblerは5秒まで延長保護（TURN遅延対応）
+        let kfThreshold: UInt64 = 5_000_000_000 // 5秒
         
         packetBuffer = packetBuffer.filter { key, assembler in
-            // ★ PNGフレームはID体系が異なる(Unix Time)可能性があるため、無条件に保持する
-            // (PNGは静止画なので、古いからといって捨ててはいけない)
-            if assembler.packetType == .pngFrame {
-                return true
+            let effectiveThreshold = (assembler.packetType == .keyFrame) ? kfThreshold : threshold
+            // 最新より新しい(未来) or 閾値以内
+            let isAlive = key >= currentTimestamp || (currentTimestamp - key < effectiveThreshold)
+            
+            // ★ Phase 2.5: タイムアウト(破棄)時の詳細ログ
+            if !isAlive && assembler.packetType == .keyFrame {
+                let percent = Int(Double(assembler.receivedCount) / Double(assembler.totalPackets) * 100)
+                Logger.network("⚠️ KF再構築失敗(Timeout): ts=\(key) 受信=\(assembler.receivedCount)/\(assembler.totalPackets)(\(percent)%) 欠落idx=[\(assembler.missingChunksString)]")
             }
-            // 最新より新しい(未来) or 最新から1秒以内
-            return key >= currentTimestamp || (currentTimestamp - key < threshold)
+            
+            return isAlive
         }
         
         // スタート時間も packetBuffer の生存に合わせてクリーンアップ

@@ -83,9 +83,12 @@ public actor P2PConnectionManager {
     /// 同時接続試行の最大数
     private let maxSimultaneousAttempts = 5
     
+    /// ★ Step 2: アクティブなTURNクライアント（relay用に維持）
+    private(set) var activeTURNClient: TURNClient?
+    
     // MARK: - Public Methods
     
-    /// ICE候補を収集（ローカル + STUN）
+    /// ICE候補を収集（ローカル + STUN + TURN）
     public func gatherCandidates(localPort: Int) async throws -> [ICECandidate] {
         state = .gatheringCandidates
         localCandidates = []
@@ -120,6 +123,21 @@ public actor P2PConnectionManager {
             Logger.p2p("⚠️ STUN候補取得失敗: \(error.localizedDescription)", level: .warning)
         }
         
+        // 3. TURN候補（relay）を取得
+        do {
+            let turnClient = TURNClient()
+            let allocation = try await turnClient.allocate()
+            let relayCandidates = await turnClient.getRelayCandidates()
+            localCandidates.append(contentsOf: relayCandidates)
+            Logger.p2p("🔄 TURN候補: \(allocation.relayIP):\(allocation.relayPort)")
+            // ★ Step 2: Allocationを維持（TURN relay用）
+            // 以前は候補収集後すぐにdeallocateしていたが、
+            // TURN relay経由のデータ転送に使用するため維持する
+            self.activeTURNClient = turnClient
+        } catch {
+            Logger.p2p("⚠️ TURN候補取得失敗（Oracle TURN未設定の可能性）: \(error.localizedDescription)", level: .warning)
+        }
+        
         return localCandidates
     }
     
@@ -129,6 +147,58 @@ public actor P2PConnectionManager {
         Logger.p2p("📥 リモート候補受信: \(candidates.count)件")
         for candidate in candidates {
             Logger.p2p("  - [\(candidate.type.rawValue)] \(candidate.ip):\(candidate.port)")
+        }
+    }
+    
+    // MARK: - Smart Connection Extensions
+    
+    /// 接続ハンドラ
+    private var connectionHandler: ((P2PConnectionState) -> Void)?
+    
+    /// 接続ハンドラを設定
+    public func setConnectionHandler(_ handler: @escaping (P2PConnectionState) -> Void) {
+        self.connectionHandler = handler
+    }
+    
+    /// ICE候補を使って接続開始（ラッパー）
+    public func connectWithICE(candidates: [ICECandidate]) {
+        Task {
+            // 状態更新
+            state = .exchangingCandidates
+            connectionHandler?(.exchangingCandidates)
+            
+            // ローカル候補収集（自分側も準備が必要）
+            // ポートはデフォルト設定を使用（動的ポート割り当て）
+            let _ = try? await gatherCandidates(localPort: 0)
+            
+            // リモート候補設定
+            setRemoteCandidates(candidates)
+            
+            do {
+                // 接続試行
+                state = .attemptingConnection
+                connectionHandler?(.attemptingConnection)
+                
+                let connection = try await attemptConnection()
+                
+                // 成功時はエンドポイント文字列を返す（簡易実装）
+                // 実際にはNWConnectionを返す方が良いが、RemoteViewModel側で再接続するためエンドポイント情報だけで十分
+                if let endpoint = connection.currentPath?.remoteEndpoint {
+                     switch endpoint {
+                     case .hostPort(let host, let port):
+                         let endpointStr = "\(host):\(port)"
+                         state = .connected(method: endpointStr)
+                         connectionHandler?(.connected(method: endpointStr))
+                     default:
+                         state = .connected(method: "Unknown Endpoint")
+                         connectionHandler?(.connected(method: "Unknown Endpoint"))
+                     }
+                }
+            } catch {
+                let reason = error.localizedDescription
+                state = .failed(reason: reason)
+                connectionHandler?(.failed(reason: reason))
+            }
         }
     }
     
@@ -171,7 +241,7 @@ public actor P2PConnectionManager {
     }
     
     /// 接続をクリーンアップ
-    public func cleanup() {
+    public func cleanup() async {
         holePunchListener?.cancel()
         holePunchListener = nil
         establishedConnection?.cancel()
@@ -179,6 +249,12 @@ public actor P2PConnectionManager {
         localCandidates = []
         remoteCandidates = []
         state = .idle
+        
+        // ★ Step 2: TURN Allocation解放
+        if let turnClient = activeTURNClient {
+            await turnClient.deallocate()
+            activeTURNClient = nil
+        }
     }
     
     // MARK: - Private Methods
@@ -188,12 +264,13 @@ public actor P2PConnectionManager {
         let parameters = NWParameters.udp
         parameters.allowLocalEndpointReuse = true
         
-        holePunchListener = try NWListener(using: parameters, on: NWEndpoint.Port(rawValue: localListeningPort)!)
+        let port = localListeningPort
+        holePunchListener = try NWListener(using: parameters, on: NWEndpoint.Port(rawValue: port)!)
         
         holePunchListener?.stateUpdateHandler = { state in
             switch state {
             case .ready:
-                Logger.p2p("🎯 ホールパンチリスナー開始: ポート\(self.localListeningPort)")
+                Logger.p2p("🎯 ホールパンチリスナー開始: ポート\(port)")
             case .failed(let error):
                 Logger.p2p("❌ ホールパンチリスナー失敗: \(error)", level: .error)
             default:
@@ -340,6 +417,6 @@ public enum P2PError: Error, LocalizedError {
 
 extension Logger {
     static func p2p(_ message: String, level: LogLevel = .info) {
-        shared.log(message, category: "P2P", level: level)
+        shared.log(message, level: level, category: .network)
     }
 }

@@ -12,15 +12,16 @@ import CoreMedia
 import CoreVideo
 import Combine
 import CoreGraphics
+import os
 
 /// キャプチャされたフレームを受け取るデリゲート
 protocol ScreenCaptureDelegate: AnyObject {
     /// フレームをキャプチャ（Zero-Copy: IOSurface-backed CVPixelBuffer）
-    func screenCapture(_ manager: ScreenCaptureManager, didCaptureFrame sampleBuffer: CMSampleBuffer)
+    nonisolated func screenCapture(_ manager: ScreenCaptureManager, didCaptureFrame sampleBuffer: CMSampleBuffer)
     /// 差分フレームをキャプチャ（Dirty Rects付き）
-    func screenCapture(_ manager: ScreenCaptureManager, didCaptureFrame sampleBuffer: CMSampleBuffer, dirtyRects: [CGRect])
+    nonisolated func screenCapture(_ manager: ScreenCaptureManager, didCaptureFrame sampleBuffer: CMSampleBuffer, dirtyRects: [CGRect])
     /// エラー発生
-    func screenCapture(_ manager: ScreenCaptureManager, didFailWithError error: Error)
+    nonisolated func screenCapture(_ manager: ScreenCaptureManager, didFailWithError error: Error)
 }
 
 /// 画面キャプチャの状態
@@ -52,10 +53,11 @@ class ScreenCaptureManager: NSObject, ObservableObject {
     var captureHeight: Int = 2160
     /// 目標フレームレート
     var targetFrameRate: Int = 60
-    /// キュー深度（バッファに保持するフレーム数）- ★ 極小化
-    var queueDepth: Int = 2  // 最小値に設定（遅延削減）
+    /// キュー深度（バッファに保持するフレーム数）- ★ Phase 2: 最小限のバッファ（ドロップ防止+低遅延）
+    var queueDepth: Int = 3  // 2だとドロップリスク、3が最適バランス
     /// Dirty Rects（差分更新）を有効化
-    var enableDirtyRects: Bool = true
+    /// ★ Phase 2: nonisolated(unsafe) — キャプチャキュー上で参照
+    nonisolated(unsafe) var enableDirtyRects: Bool = true
     /// 10-bit キャプチャ（高色精度）
     var use10Bit: Bool = false  // デフォルトは8-bit、互換性のため
     
@@ -71,8 +73,8 @@ class ScreenCaptureManager: NSObject, ObservableObject {
     @Published private(set) var lastCapturedPhysicalHeight: Int = 0
     
     // MARK: - Delegate
-    
-    weak var delegate: ScreenCaptureDelegate?
+    /// ★ Phase 2: nonisolated(unsafe)—キャプチャキューから直接アクセス可能
+    nonisolated(unsafe) weak var delegate: ScreenCaptureDelegate?
     
     // MARK: - Private Properties
     
@@ -82,8 +84,15 @@ class ScreenCaptureManager: NSObject, ObservableObject {
     private var frameRateCalculationTimer: Timer?
     private var recentFrameTimes: [CFTimeInterval] = []
     
+    /// ★ Phase 2: キャプチャキュー上で安全にカウントするためのアトミックカウンタ
+    nonisolated(unsafe) private let _frameCountLock = NSLock()
+    nonisolated(unsafe) private var _atomicFrameCount: Int = 0
+    /// ★ Phase 2: フレーム時刻追跡（キャプチャキュー安全）
+    nonisolated(unsafe) private let _frameTimesLock = NSLock()
+    nonisolated(unsafe) private var _atomicFrameTimes: [CFTimeInterval] = []
+    
     /// スクリーンショットカウンター（ログ頻度制御用）
-    private var screenshotCount = 0
+    // screenshotCount は動画一本化により廃止
     
     // MARK: - Initialization
     
@@ -117,6 +126,143 @@ class ScreenCaptureManager: NSObject, ObservableObject {
         }
     }
     
+    // MARK: - ★ ズーム連動キャプチャ
+    
+    /// 現在のキャプチャ領域（nil = 全画面）
+    private(set) var currentCaptureRegion: CGRect? = nil
+    
+    /// ログスロットリング: キャプチャ領域変更（500ms間隔）
+    private var lastRegionLogTime: Date = .distantPast
+    private var wasFullScreen: Bool = true
+    
+    /// ログスロットリング: 設定更新（前回値と比較）
+    private var lastLoggedScale: Double = -1
+    private var lastLoggedFPS: Int = -1
+    
+    /// ★ キャプチャ領域を動的に変更（ズーム連動）
+    /// - Parameter normalizedRect: 正規化座標(0.0〜1.0)でのキャプチャ領域。nilで全画面復帰。
+    ///
+    /// iPhoneのズームに連動してMac側のキャプチャ対象領域を変更する。
+    /// 出力解像度は固定のまま、狭い領域だけをキャプチャ → 実効解像度が向上。
+    func updateCaptureRegion(_ normalizedRect: CGRect?) async throws {
+        guard let stream = stream, let display = selectedDisplay else { return }
+        
+        // CaptureState確認
+        if case .capturing = state {
+            // OK
+        } else {
+            return
+        }
+        
+        let config = SCStreamConfiguration()
+        
+        if let rect = normalizedRect {
+            // 正規化座標 → ディスプレイ座標に変換
+            let displayWidth = CGFloat(display.width)
+            let displayHeight = CGFloat(display.height)
+            
+            let sourceX = rect.origin.x * displayWidth
+            let sourceY = rect.origin.y * displayHeight
+            let sourceW = rect.size.width * displayWidth
+            let sourceH = rect.size.height * displayHeight
+            
+            // sourceRect: キャプチャ対象領域（ディスプレイ論理座標）
+            config.sourceRect = CGRect(x: sourceX, y: sourceY, width: sourceW, height: sourceH)
+            
+            // destinationRect: 出力バッファ内の描画領域（出力サイズ全体に拡大）
+            config.destinationRect = CGRect(x: 0, y: 0,
+                                            width: CGFloat(config.width),
+                                            height: CGFloat(config.height))
+            
+            currentCaptureRegion = rect
+            wasFullScreen = false
+            let now = Date()
+            if now.timeIntervalSince(lastRegionLogTime) >= 0.5 {
+                lastRegionLogTime = now
+                print("[ScreenCapture] 🔍 キャプチャ領域変更: (\(String(format: "%.2f", rect.origin.x)), \(String(format: "%.2f", rect.origin.y))) \(String(format: "%.2f", rect.size.width))x\(String(format: "%.2f", rect.size.height))")
+            }
+        } else {
+            // 全画面復帰: sourceRect/destinationRectをリセット
+            config.sourceRect = .zero
+            config.destinationRect = .zero
+            
+            currentCaptureRegion = nil
+            if !wasFullScreen {
+                wasFullScreen = true
+                print("[ScreenCapture] 🔍 キャプチャ領域: 全画面復帰")
+            }
+        }
+        
+        // 現在の設定を維持
+        let currentWidth = captureWidth
+        let currentHeight = captureHeight
+        let scale = min(
+            Double(currentWidth) / Double(display.width),
+            Double(currentHeight) / Double(display.height),
+            1.0
+        )
+        var finalWidth = Int(Double(display.width) * scale)
+        var finalHeight = Int(Double(display.height) * scale)
+        finalWidth += (finalWidth % 2)
+        finalHeight += (finalHeight % 2)
+        
+        config.width = finalWidth
+        config.height = finalHeight
+        config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(targetFrameRate))
+        config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        config.queueDepth = queueDepth
+        config.showsCursor = true
+        
+        try await stream.updateConfiguration(config)
+    }
+    
+    /// ★ 適応型Retina: キャプチャスケールを動的に切り替え
+    /// - Parameter captureScale: 1.0 = 論理解像度, 2.0 = Retina物理解像度
+    /// - Parameter fps: フレームレート（nilで現在値維持）
+    func updateRetinaScale(_ captureScale: CGFloat, fps: Int? = nil) async throws {
+        guard let stream = stream, let display = selectedDisplay else { return }
+        
+        if case .capturing = state {
+            // OK
+        } else {
+            return
+        }
+        
+        if let newFps = fps {
+            targetFrameRate = newFps
+        }
+        
+        let config = SCStreamConfiguration()
+        
+        // captureScale: 1.0 = 論理解像度(display.width), 2.0 = 物理解像度(display.width * 2)
+        let effectiveScale = min(captureScale, 2.0)  // 最大2x
+        var finalWidth = Int(Double(display.width) * Double(effectiveScale))
+        var finalHeight = Int(Double(display.height) * Double(effectiveScale))
+        finalWidth += (finalWidth % 2)
+        finalHeight += (finalHeight % 2)
+        
+        config.width = finalWidth
+        config.height = finalHeight
+        config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(targetFrameRate))
+        config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        config.queueDepth = queueDepth
+        config.showsCursor = true
+        
+        // キャプチャ領域が設定されている場合は維持
+        if let region = currentCaptureRegion {
+            let sourceX = Double(display.width) * Double(region.origin.x)
+            let sourceY = Double(display.height) * Double(region.origin.y)
+            let sourceW = Double(display.width) * Double(region.width)
+            let sourceH = Double(display.height) * Double(region.height)
+            config.sourceRect = CGRect(x: sourceX, y: sourceY, width: sourceW, height: sourceH)
+            config.destinationRect = CGRect(x: 0, y: 0, width: finalWidth, height: finalHeight)
+        }
+        
+        print("[ScreenCapture] ★ Retina切替: \(finalWidth)x\(finalHeight) (scale=\(effectiveScale), FPS=\(targetFrameRate))")
+        
+        try await stream.updateConfiguration(config)
+    }
+    
     /// ★ Adaptive Resolution: 解像度スケールとフレームレートを動的に変更
     /// - Parameter scale: 物理ピクセルに対するスケール（例: 0.5 = 面積1/4）
     /// - Parameter fps: 目標フレームレート（nilの場合は現在値を維持）
@@ -135,7 +281,11 @@ class ScreenCaptureManager: NSObject, ObservableObject {
             targetFrameRate = newFps
         }
         
-        print("[ScreenCapture] 設定更新: スケール \(scale), FPS \(targetFrameRate)")
+        if scale != lastLoggedScale || targetFrameRate != lastLoggedFPS {
+            lastLoggedScale = scale
+            lastLoggedFPS = targetFrameRate
+            print("[ScreenCapture] 設定更新: スケール \(scale), FPS \(targetFrameRate)")
+        }
         
         let config = SCStreamConfiguration()
         let width = Int(Double(display.width) * scale)
@@ -270,12 +420,12 @@ class ScreenCaptureManager: NSObject, ObservableObject {
             stream = SCStream(filter: filter, configuration: configuration, delegate: self)
             
             // 出力設定
+            // ★ Phase 2: MainActor排除 — キャプチャキュー上で直接フレーム処理
             streamOutput = CaptureStreamOutput { [weak self] sampleBuffer in
-                Task { @MainActor in
-                    self?.handleCapturedFrame(sampleBuffer)
-                }
+                // ★ MainActorを経由せず、キャプチャキュー上で直接実行
+                self?.handleCapturedFrameFast(sampleBuffer)
             }
-            try stream?.addStreamOutput(streamOutput!, type: .screen, sampleHandlerQueue: DispatchQueue(label: "com.myremotehost.screencapture"))
+            try stream?.addStreamOutput(streamOutput!, type: .screen, sampleHandlerQueue: DispatchQueue(label: "com.myremotehost.screencapture", qos: .userInteractive))
             
             // 開始
             try await stream?.startCapture()
@@ -310,74 +460,27 @@ class ScreenCaptureManager: NSObject, ObservableObject {
         print("[ScreenCapture] キャプチャ停止完了 (総フレーム数: \(capturedFrameCount))")
     }
     
-    /// ★ フル解像度（ネイティブ）の静止画をキャプチャ
-    /// 動画ストリームのスケーリングに関係なく、物理ピクセル100%の画質を取得する
-    func captureNativeResolutionSnapshot() async throws -> CGImage {
-        guard let display = selectedDisplay else { throw CaptureError.noDisplaySelected }
-        
-        if #available(macOS 14.0, *) {
-            // macOS 14以降: ScreenCaptureKit のスクリーンショット機能を使用
-            let filter = SCContentFilter(display: display, excludingWindows: [])
-            let config = SCStreamConfiguration()
-            
-            // -------------------------------------------------------------
-            // ★ iPhone最適化: Retina物理解像度ではなく論理解像度を使用
-            // 物理解像度 (3420x2214) はiPhoneの処理能力を超えるため、
-            // 論理解像度 (1710x1107) に制限してパフォーマンスを最適化する。
-            // これでもiPhone画面より大きいため、十分な画質を確保できる。
-            // -------------------------------------------------------------
-            let targetWidth = display.width   // 論理解像度を使用
-            let targetHeight = display.height // 論理解像度を使用
-            
-            // 物理フル解像度に設定 (ScreenCaptureKitへ要求)
-            config.width = targetWidth
-            config.height = targetHeight
-            config.showsCursor = true
-            
-            // ピクセルフォーマット（BGRA 32bit）- 可逆圧縮PNGのソースとして最適
-            config.pixelFormat = kCVPixelFormatType_32BGRA
-            
-            // ★ キャプチャ実行
-            let start = CFAbsoluteTimeGetCurrent()
-            let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-            let duration = CFAbsoluteTimeGetCurrent() - start
-            
-            // ★ 100回ごとにログ出力
-            screenshotCount += 1
-            if screenshotCount == 1 || screenshotCount % 100 == 0 {
-                let isValid = image.width >= targetWidth && image.height >= targetHeight
-                print("[ScreenCapture] 📸 \(image.width)x\(image.height) (\(String(format: "%.0f", duration * 1000))ms) \(isValid ? "✓" : "⚠️ Scaled") (累計\(screenshotCount)回)")
-            }
-            
-            return image
-        }
-        
-        // フォールバック
-        print("[ScreenCapture] macOS 14.0未満のため高解像度静止画キャプチャ不可")
-        throw CaptureError.configurationFailed
-    }
+    // ★ 動画一本化: captureNativeResolutionSnapshot() は廃止
     
     // MARK: - Private Methods
     
-    private func handleCapturedFrame(_ sampleBuffer: CMSampleBuffer) {
-        capturedFrameCount += 1
+    // ★ Phase 2: MainActor排除版 — キャプチャキュー上で直接実行
+    // nonisolatedで呼び出されるため、MainActorプロパティにアクセスしない
+    nonisolated private func handleCapturedFrameFast(_ sampleBuffer: CMSampleBuffer) {
+        // アトミックカウンタ更新
+        _frameCountLock.lock()
+        _atomicFrameCount += 1
+        let count = _atomicFrameCount
+        _frameCountLock.unlock()
         
-        // フレームレート計算用
+        // フレーム時刻追跡（FPS計算用）
         let currentTime = CACurrentMediaTime()
-        recentFrameTimes.append(currentTime)
+        _frameTimesLock.lock()
+        _atomicFrameTimes.append(currentTime)
+        _atomicFrameTimes = _atomicFrameTimes.filter { currentTime - $0 < 1.0 }
+        _frameTimesLock.unlock()
         
-        // 直近1秒分のフレーム時間のみ保持
-        recentFrameTimes = recentFrameTimes.filter { currentTime - $0 < 1.0 }
-        
-        // ★ Zero-Copy 検証: IOSurface が裏打ちされていることを確認
-        if let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
-            let hasIOSurface = CVPixelBufferGetIOSurface(pixelBuffer) != nil
-            if !hasIOSurface {
-                print("[ScreenCapture] ⚠️ IOSurface なし - Zero-Copy 不可")
-            }
-        }
-        
-        // ★ Dirty Rects 抽出
+        // ★ Dirty Rects 抽出（キャプチャキュー上で実行）
         var dirtyRects: [CGRect] = []
         if enableDirtyRects {
             if let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]],
@@ -390,28 +493,47 @@ class ScreenCaptureManager: NSObject, ObservableObject {
                 }
                 
                 // 変化なし → フレームスキップ（帯域節約）
-                if dirtyRects.isEmpty && capturedFrameCount > 1 {
+                if dirtyRects.isEmpty && count > 1 {
                     // 静止フレームは10フレームに1回だけ送信
-                    if capturedFrameCount % 10 != 0 {
+                    if count % 10 != 0 {
                         return  // スキップ
                     }
                 }
             }
         }
         
-        // デリゲートに通知
+        // デリゲートに直接通知（MainActorを経由しない）
+        // CaptureViewModelのデリゲートメソッドはnonisolatedなので安全
         if dirtyRects.isEmpty {
             delegate?.screenCapture(self, didCaptureFrame: sampleBuffer)
         } else {
             delegate?.screenCapture(self, didCaptureFrame: sampleBuffer, dirtyRects: dirtyRects)
         }
+        
+        // MainActorプロパティ更新は非同期で（表示用のみ、クリティカルパス外）
+        Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            self.capturedFrameCount = count
+        }
+    }
+    
+    /// 旧バージョン（後方互換用、dirtyRectsなしパスでのみ使用）
+    private func handleCapturedFrame(_ sampleBuffer: CMSampleBuffer) {
+        capturedFrameCount += 1
+        let currentTime = CACurrentMediaTime()
+        recentFrameTimes.append(currentTime)
+        recentFrameTimes = recentFrameTimes.filter { currentTime - $0 < 1.0 }
+        delegate?.screenCapture(self, didCaptureFrame: sampleBuffer)
     }
     
     private func startFrameRateMonitoring() {
         frameRateCalculationTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            self._frameTimesLock.lock()
+            let count = self._atomicFrameTimes.count
+            self._frameTimesLock.unlock()
             Task { @MainActor in
-                guard let self = self else { return }
-                self.frameRate = Double(self.recentFrameTimes.count)
+                self.frameRate = Double(count)
             }
         }
     }

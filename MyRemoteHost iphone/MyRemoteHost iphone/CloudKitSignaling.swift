@@ -72,7 +72,7 @@ public struct HostDeviceRecord: Sendable, Identifiable {
         self.hostUserRecordID = record[Keys.hostUserRecordID] as? String ?? ""
         self.deviceName = record[Keys.deviceName] as? String ?? "Unknown"
         self.localIP = record[Keys.localIP] as? String ?? ""
-        self.localPort = record[Keys.localPort] as? Int ?? 5000
+        self.localPort = record[Keys.localPort] as? Int ?? Int(NetworkTransportConfiguration.default.videoPort)
         self.publicIP = record[Keys.publicIP] as? String
         self.publicPort = record[Keys.publicPort] as? Int
         self.isOnline = record[Keys.isOnline] as? Bool ?? false
@@ -125,7 +125,11 @@ actor CloudKitSignalingManager {
     /// ★ Private Databaseでは自分のデータのみアクセス可能なため
     ///   hostUserRecordIDでのフィルタリングは不要
     func discoverMyHosts() async throws -> [HostDeviceRecord] {
-        // Private DBでは自分のレコードのみ → オンラインのみでフィルタ
+        // ★ CloudKitダッシュボードでインデックス追加済み:
+        //   - recordName: QUERYABLE
+        //   - isOnline: QUERYABLE
+        //   - deviceName: QUERYABLE
+        //   - lastHeartbeat: SORTABLE
         let predicate = NSPredicate(format: "%K == %@",
                                     HostDeviceRecord.Keys.isOnline, NSNumber(value: true))
         let query = CKQuery(recordType: HostDeviceRecord.recordType, predicate: predicate)
@@ -137,14 +141,14 @@ actor CloudKitSignalingManager {
         for (_, result) in results {
             if case .success(let record) = result {
                 let host = HostDeviceRecord(from: record)
-                // ハートビートが有効なもののみ
-                if host.isHeartbeatValid {
+                // ハートビート10分以内のみ有効
+                if Date().timeIntervalSince(host.lastHeartbeat) < 600 {
                     hosts.append(host)
                 }
             }
         }
         
-        print("[CloudKitSignaling] 🔍 発見したホスト: \(hosts.count)台 (Private DB)")
+        print("[CloudKitSignaling] 🔍 発見したホスト: \(hosts.count)台 (Private DB, CKQuery)")
         return hosts
     }
     

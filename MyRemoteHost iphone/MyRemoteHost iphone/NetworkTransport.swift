@@ -23,8 +23,7 @@ public enum NetworkPacketType: UInt8, Sendable {
     case pps = 0x02
     case videoFrame = 0x03
     case keyFrame = 0x04
-    case jpegFrame = 0x05  // Deprecated
-    case pngFrame = 0x06   // PNG 静止画フレーム
+
     case fecParity = 0x07  // FECパリティブロック
     case metadata = 0x08   // Retinaメタデータ
 }
@@ -150,14 +149,23 @@ public struct NetworkTransportConfiguration: Sendable {
     /// 暗号化有効化
     public let encryptionEnabled: Bool
     
+    /// 映像転送ポート（UDP）
+    public let videoPort: UInt16
+    
+    /// 入力制御ポート（TCP）
+    public let inputPort: UInt16
+    
     /// デフォルト設定
+    /// ★ videoPort: 5100 (Mac側と統一、macOS AirPlay Receiver回避)
     public static let `default` = NetworkTransportConfiguration(
         maxPacketSize: 1400,
         heartbeatInterval: 1.0,
         connectionTimeout: 10.0,
         clientTimeout: 10.0,
-        fecEnabled: false,
-        encryptionEnabled: false
+        fecEnabled: true,
+        encryptionEnabled: true,
+        videoPort: 5100,
+        inputPort: 5002
     )
     
     /// 高信頼性設定（商用向け）
@@ -167,7 +175,9 @@ public struct NetworkTransportConfiguration: Sendable {
         connectionTimeout: 15.0,
         clientTimeout: 15.0,
         fecEnabled: true,
-        encryptionEnabled: true
+        encryptionEnabled: true,
+        videoPort: 5100,
+        inputPort: 5002
     )
     
     public init(
@@ -176,7 +186,9 @@ public struct NetworkTransportConfiguration: Sendable {
         connectionTimeout: TimeInterval,
         clientTimeout: TimeInterval,
         fecEnabled: Bool,
-        encryptionEnabled: Bool
+        encryptionEnabled: Bool,
+        videoPort: UInt16 = 5100,
+        inputPort: UInt16 = 5002
     ) {
         self.maxPacketSize = maxPacketSize
         self.heartbeatInterval = heartbeatInterval
@@ -184,6 +196,8 @@ public struct NetworkTransportConfiguration: Sendable {
         self.clientTimeout = clientTimeout
         self.fecEnabled = fecEnabled
         self.encryptionEnabled = encryptionEnabled
+        self.videoPort = videoPort
+        self.inputPort = inputPort
     }
 }
 
@@ -197,7 +211,7 @@ public enum NetworkTransportType: Sendable {
     /// WebRTC接続（NAT越え対応）将来実装
     case webRTC
     
-    /// TURNリレー接続（フォールバック）将来実装
+    /// TURNリレー接続（Phase 1: Oracle TURN対応）
     case turnRelay
 }
 
@@ -207,16 +221,16 @@ public enum NetworkTransportFactory {
     
     /// 現在利用可能なトランスポート種別
     public static var availableTransports: [NetworkTransportType] {
-        // Phase 0: 直接UDPのみ
-        // Phase 2以降: WebRTC, TURNリレーを追加
-        return [.directUDP]
+        // Phase 1: 直接UDP + TURNリレー
+        // Phase 2以降: WebRTCを追加
+        return [.directUDP, .turnRelay]
     }
     
     /// 最適なトランスポートを自動選択
-    /// Phase 2以降: ネットワーク環境に応じて自動選択
+    /// Phase 1: P2P（直接UDP）→ TURN リレー の順で試行
     public static func recommendedTransport() -> NetworkTransportType {
-        // 現在は直接UDP固定
-        // 将来: ICE候補に基づいて選択
+        // 現在は直接UDP優先、P2P失敗時にTURNフォールバック
+        // 将来: ICE候補とネットワーク環境に基づいて自動選択
         return .directUDP
     }
 }

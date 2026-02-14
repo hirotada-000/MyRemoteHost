@@ -40,3 +40,6 @@ fastlane/test_output
 
 # Code Injection
 iOSInjectionProject/
+
+# Debug build logs
+*_build_debug*.log

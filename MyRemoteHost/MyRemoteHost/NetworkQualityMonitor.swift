@@ -109,6 +109,19 @@ class NetworkQualityMonitor: ObservableObject {
     private var qualityChangeCounter = 0
     private let qualityChangeThreshold = 3  // 3回連続で同じ判定なら変更
     
+    // MARK: - Phase 4: Network Simulation
+    
+    enum DebugNetworkCondition {
+        case normal
+        case highLatency   // RTT = 200ms
+        case packetLoss    // Loss = 10%
+        case congestion    // Bandwidth = 3Mbps
+        case excellent     // RTT = 5ms, Loss = 0%
+    }
+    
+    /// デバッグ用シミュレーションモード（nilなら通常動作）
+    @Published var debugSimulation: DebugNetworkCondition? = nil
+    
     // MARK: - Initialization
     
     init() {}
@@ -164,7 +177,7 @@ class NetworkQualityMonitor: ObservableObject {
         guard data.count >= 5, data[0] == 0xEF else { return }
         
         let sequence = data.subdata(in: 1..<5).withUnsafeBytes {
-            UInt32(bigEndian: $0.load(as: UInt32.self))
+            UInt32(bigEndian: $0.loadUnaligned(fromByteOffset: 0, as: UInt32.self))
         }
         
         guard let sentTime = pendingPings.removeValue(forKey: sequence) else { return }
@@ -222,6 +235,12 @@ class NetworkQualityMonitor: ObservableObject {
     // MARK: - Private Methods
     
     private func evaluateQuality() {
+        // ★ Phase 4: シミュレーションオーバーライド
+        if let simulation = debugSimulation {
+            applySimulation(simulation)
+            return // 通常の評価をスキップ
+        }
+        
         let newLevel = currentMetrics.qualityLevel
         
         // 頻繁な変動を防ぐため、連続で同じ判定が出た場合のみ変更
@@ -241,6 +260,39 @@ class NetworkQualityMonitor: ObservableObject {
                     print("[NetworkQualityMonitor] 品質レベル変更: \(newLevel.rawValue) (RTT: \(String(format: "%.1f", self.currentMetrics.rtt * 1000))ms)")
                 }
             }
+        }
+    }
+    
+    /// シミュレーション値を適用
+    private func applySimulation(_ condition: DebugNetworkCondition) {
+        var simulatedMetrics = currentMetrics
+        var simulatedLevel: NetworkQualityLevel = .good
+        
+        switch condition {
+        case .normal:
+            return // 何もしない（またはシミュレーション解除）
+        case .highLatency:
+            simulatedMetrics.rtt = 0.200 // 200ms
+            simulatedLevel = .poor
+        case .packetLoss:
+            simulatedMetrics.packetLossRate = 0.10 // 10%
+            simulatedLevel = .poor
+        case .congestion:
+            simulatedMetrics.bandwidth = 3.0 // 3Mbps
+            simulatedLevel = .moderate // RTT次第だが簡易的に
+        case .excellent:
+            simulatedMetrics.rtt = 0.005 // 5ms
+            simulatedLevel = .excellent
+        }
+        
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.currentMetrics = simulatedMetrics
+            self.qualityLevel = simulatedLevel
+            self.delegate?.networkQualityMonitor(self, didUpdateMetrics: simulatedMetrics)
+            self.delegate?.networkQualityMonitor(self, didChangeQuality: simulatedLevel)
+            
+            print("[NetworkQualityMonitor] 🧪 Simulation: \(condition) -> \(simulatedLevel.rawValue)")
         }
     }
     

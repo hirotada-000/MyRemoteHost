@@ -19,7 +19,9 @@ protocol InputReceiverDelegate: AnyObject {
     func inputReceiver(_ receiver: InputReceiver, didReceiveEvent type: String)
     func inputReceiver(_ receiver: InputReceiver, didFailWithError error: Error)
     func inputReceiver(_ receiver: InputReceiver, didReceiveZoomRequest isZooming: Bool, rect: CGRect, scale: CGFloat)
+    func inputReceiver(_ receiver: InputReceiver, didReceiveTelemetry metrics: ClientDeviceMetrics) // ★ Phase 1
     func inputReceiver(_ receiver: InputReceiver, didReceiveRegistration listenPort: UInt16, userRecordID: String?, clientHost: String)  // ★ 登録受信
+    func inputReceiver(_ receiver: InputReceiver, didUpdateScrollMetrics velocity: CGPoint, isScrolling: Bool) // ★ Phase 1: Input Physics
 }
 
 /// 入力イベント受信・シミュレーションクラス
@@ -36,6 +38,7 @@ class InputReceiver {
         case keyDown = 0x20
         case keyUp = 0x21
         case zoomRequest = 0x30  // ★ ズームリクエスト（ROI送信要求）
+        case telemetry = 0x40    // ★ Phase 1: クライアントテレメトリ
         case registration = 0xFE  // ★ クライアント登録
     }
     
@@ -67,6 +70,10 @@ class InputReceiver {
     
     /// ★ 開始中フラグ（重複開始防止）
     private var isStarting = false
+    
+    /// ★ Phase 1: Input Physics state
+    private var scrollPhysics = ScrollPhysicsState()
+    private let scrollIdleThreshold: TimeInterval = 0.2
     
     /// メインディスプレイのサイズ
     private var displaySize: CGSize {
@@ -179,7 +186,7 @@ class InputReceiver {
         connection.stateUpdateHandler = { [weak self] newState in
             switch newState {
             case .ready:
-                print("[InputReceiver] 接続Ready - データ受信待機")  // ★ デバッグログ
+                print("✅ [InputReceiver] 接続Ready - データ受信待機")
                 self?.receiveEvents(on: connection)
             case .failed(let error):
                 print("[InputReceiver] 接続失敗: \(error)")
@@ -235,6 +242,8 @@ class InputReceiver {
             handleKeyUp(payload)
         case .zoomRequest:
             handleZoomRequest(payload)
+        case .telemetry:
+            handleTelemetry(payload)
         case .registration:
             handleRegistration(payload, from: connection)  // ★ 登録処理
         }
@@ -245,9 +254,9 @@ class InputReceiver {
     private func handleMouseMove(_ payload: Data) {
         guard payload.count >= 8 else { return }
         
-        // 正規化座標を取得 (0.0-1.0)
-        let normalizedX = payload.withUnsafeBytes { $0.load(fromByteOffset: 0, as: Float32.self) }
-        let normalizedY = payload.withUnsafeBytes { $0.load(fromByteOffset: 4, as: Float32.self) }
+        // 正規化座標を取得 (0.0-1.0) — bigEndianからデコード
+        let normalizedX = Float(bitPattern: UInt32(bigEndian: payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 0, as: UInt32.self) }))
+        let normalizedY = Float(bitPattern: UInt32(bigEndian: payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 4, as: UInt32.self) }))
         
         // Mac座標に変換
         let x = CGFloat(normalizedX) * displaySize.width
@@ -323,8 +332,8 @@ class InputReceiver {
     private func handleMouseScroll(_ payload: Data) {
         guard payload.count >= 8 else { return }
         
-        let deltaX = payload.withUnsafeBytes { $0.load(fromByteOffset: 0, as: Float32.self) }
-        let deltaY = payload.withUnsafeBytes { $0.load(fromByteOffset: 4, as: Float32.self) }
+        let deltaX = Float(bitPattern: UInt32(bigEndian: payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 0, as: UInt32.self) }))
+        let deltaY = Float(bitPattern: UInt32(bigEndian: payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 4, as: UInt32.self) }))
         
         // CGEventCreateScrollWheelEventを使用
         if let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel,
@@ -334,6 +343,41 @@ class InputReceiver {
                                wheel3: 0) {
             event.post(tap: .cghidEventTap)
         }
+        
+        // ★ Phase 1: Input Physics Calculation
+        let now = Date()
+        let dt = now.timeIntervalSince(scrollPhysics.lastUpdateTime)
+        
+        if dt > 0.001 { // ゼロ除算防止
+            // 速度計算 (pixels/sec) - deltaは正規化されている可能性に注意が必要だが、InputSenderではfloatBytes(delta)を送っている
+            // InputSenderでのdeltaX/YはUIPanGestureRecognizer.translation由来で、画面サイズ依存のピクセル値に近い
+            // ここでは簡易的に「イベント値 / 時間」を指標とする
+            let vx = Double(deltaX) / dt
+            let vy = Double(deltaY) / dt
+            
+            scrollPhysics.velocityX = vx
+            scrollPhysics.velocityY = vy
+            scrollPhysics.isScrolling = true
+            scrollPhysics.lastUpdateTime = now
+            
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.delegate?.inputReceiver(self, didUpdateScrollMetrics: CGPoint(x: vx, y: vy), isScrolling: true)
+            }
+        }
+        
+        // スクロール終了判定用の遅延処理（簡易）
+        DispatchQueue.main.asyncAfter(deadline: .now() + scrollIdleThreshold) { [weak self] in
+            guard let self = self else { return }
+            if Date().timeIntervalSince(self.scrollPhysics.lastUpdateTime) >= self.scrollIdleThreshold {
+                if self.scrollPhysics.isScrolling {
+                    self.scrollPhysics.isScrolling = false
+                    self.scrollPhysics.velocityX = 0
+                    self.scrollPhysics.velocityY = 0
+                    self.delegate?.inputReceiver(self, didUpdateScrollMetrics: .zero, isScrolling: false)
+                }
+            }
+        }
     }
     
     // MARK: - Keyboard Event Handlers
@@ -341,7 +385,7 @@ class InputReceiver {
     private func handleKeyDown(_ payload: Data) {
         guard payload.count >= 2 else { return }
         
-        let keyCode = payload.withUnsafeBytes { $0.load(as: UInt16.self) }
+        let keyCode = UInt16(bigEndian: payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 0, as: UInt16.self) })
         
         if let event = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(keyCode), keyDown: true) {
             event.post(tap: .cghidEventTap)
@@ -353,7 +397,7 @@ class InputReceiver {
     private func handleKeyUp(_ payload: Data) {
         guard payload.count >= 2 else { return }
         
-        let keyCode = payload.withUnsafeBytes { $0.load(as: UInt16.self) }
+        let keyCode = UInt16(bigEndian: payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 0, as: UInt16.self) })
         
         if let event = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(keyCode), keyDown: false) {
             event.post(tap: .cghidEventTap)
@@ -374,20 +418,20 @@ class InputReceiver {
         
         let isZooming = payload[0] == 1
         
-        // ★ アラインメント問題を回避するため、memcpyスタイルで読み込み
-        var x: Float32 = 0
-        var y: Float32 = 0
-        var width: Float32 = 0
-        var height: Float32 = 0
-        var scale: Float32 = 0
-        
+        // ★ bigEndianからデコード
+        var rawX: UInt32 = 0, rawY: UInt32 = 0, rawW: UInt32 = 0, rawH: UInt32 = 0, rawS: UInt32 = 0
         payload.withUnsafeBytes { buffer in
-            memcpy(&x, buffer.baseAddress!.advanced(by: 1), 4)
-            memcpy(&y, buffer.baseAddress!.advanced(by: 5), 4)
-            memcpy(&width, buffer.baseAddress!.advanced(by: 9), 4)
-            memcpy(&height, buffer.baseAddress!.advanced(by: 13), 4)
-            memcpy(&scale, buffer.baseAddress!.advanced(by: 17), 4)
+            memcpy(&rawX, buffer.baseAddress!.advanced(by: 1), 4)
+            memcpy(&rawY, buffer.baseAddress!.advanced(by: 5), 4)
+            memcpy(&rawW, buffer.baseAddress!.advanced(by: 9), 4)
+            memcpy(&rawH, buffer.baseAddress!.advanced(by: 13), 4)
+            memcpy(&rawS, buffer.baseAddress!.advanced(by: 17), 4)
         }
+        let x = Float(bitPattern: UInt32(bigEndian: rawX))
+        let y = Float(bitPattern: UInt32(bigEndian: rawY))
+        let width = Float(bitPattern: UInt32(bigEndian: rawW))
+        let height = Float(bitPattern: UInt32(bigEndian: rawH))
+        let scale = Float(bitPattern: UInt32(bigEndian: rawS))
         
         let rect = CGRect(x: CGFloat(x), y: CGFloat(y), width: CGFloat(width), height: CGFloat(height))
         
@@ -410,7 +454,7 @@ class InputReceiver {
         
         // リスニングポート（2バイト、bigEndian）
         let listenPort = UInt16(bigEndian: payload.subdata(in: 0..<2).withUnsafeBytes {
-            $0.load(as: UInt16.self)
+            $0.loadUnaligned(fromByteOffset: 0, as: UInt16.self)
         })
         
         // userRecordID（残り）
@@ -431,6 +475,65 @@ class InputReceiver {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             self.delegate?.inputReceiver(self, didReceiveRegistration: listenPort, userRecordID: userRecordID, clientHost: clientHost)
+        }
+    }
+    
+    // MARK: - Auth Result (UDP経由)
+    
+    /// ★ 認証結果をUDP経由でクライアントに送信
+    /// TCP(port5100)経由の認証通知が届かない場合のバックアップパス
+    func sendAuthResult(approved: Bool, toHost host: String, port: UInt16) {
+        let endpoint = NWEndpoint.hostPort(
+            host: NWEndpoint.Host(host),
+            port: NWEndpoint.Port(rawValue: port)!
+        )
+        
+        let connection = NWConnection(to: endpoint, using: .udp)
+        connection.stateUpdateHandler = { newState in
+            if case .ready = newState {
+                // 認証結果パケット: [0xAA] [結果: 0x01=許可, 0x00=拒否]
+                let packet = Data([0xAA, approved ? 0x01 : 0x00])
+                connection.send(content: packet, completion: .contentProcessed { error in
+                    if let error = error {
+                        Logger.network("❌ UDP認証結果送信エラー: \(error)", level: .error)
+                    } else {
+                        Logger.network("📤 UDP認証結果送信成功 → \(host):\(port) (approved=\(approved))")
+                    }
+                    // 送信後に接続を閉じる
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        connection.cancel()
+                    }
+                })
+            }
+        }
+        connection.start(queue: receiveQueue)
+    }
+    
+    // MARK: - Telemetry Handler
+    
+    private func handleTelemetry(_ payload: Data) {
+        // フォーマット: 
+        // batteryLevel(4) + isCharging(1) + thermalState(1) + isLowPower(1) + fps(8) = 15 bytes
+        guard payload.count >= 15 else { return }
+        
+        // ★ bigEndianからデコード
+        let batteryLevel = Float(bitPattern: UInt32(bigEndian: payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 0, as: UInt32.self) }))
+        let isCharging = payload[4] == 1
+        let thermalState = Int(payload[5])
+        let isLowPower = payload[6] == 1
+        let fps = Double(bitPattern: UInt64(bigEndian: payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 7, as: UInt64.self) }))
+        
+        let metrics = ClientDeviceMetrics(
+            batteryLevel: batteryLevel,
+            isCharging: isCharging,
+            thermalState: thermalState,
+            isLowPowerModeEnabled: isLowPower,
+            currentFPS: fps
+        )
+        
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.delegate?.inputReceiver(self, didReceiveTelemetry: metrics)
         }
     }
 }

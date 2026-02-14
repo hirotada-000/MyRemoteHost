@@ -6,7 +6,7 @@
 //  Phase 3: セキュア通信の実装
 //
 //  CryptoKitを使用したAES-256-GCM暗号化
-//  - ECDH鍵交換（P-256）
+//  - ECDH鍵交換（Curve25519）
 //  - 対称鍵生成
 //  - データ暗号化/復号
 //  - Keychain保存
@@ -122,30 +122,32 @@ class CryptoManager {
     // MARK: - Convenience Methods
     
     /// 暗号化が必要かどうか判定し、必要ならば暗号化
-    func encryptIfEnabled(_ data: Data) -> Data {
+    /// - Returns: 暗号化データ。暗号化無効時は平文をそのまま返す。暗号化有効時に失敗した場合はnilを返す（平文送信防止）
+    func encryptIfEnabled(_ data: Data) -> Data? {
         guard isEnabled, hasKey else {
-            return data
+            return data  // 暗号化無効 or 鍵未設定 → 平文OK（鍵交換前の正常動作）
         }
         
         do {
             return try encrypt(data)
         } catch {
-            print("[CryptoManager] 暗号化エラー: \(error)")
-            return data  // 暗号化失敗時は平文で送信
+            print("[CryptoManager] ❌ 暗号化失敗（パケット破棄）: \(error)")
+            return nil  // 平文送信を防止
         }
     }
     
     /// 復号が必要かどうか判定し、必要ならば復号
-    func decryptIfEnabled(_ data: Data) -> Data {
+    /// - Returns: 復号データ。暗号化無効時はデータをそのまま返す。復号失敗時はnilを返す（破損パケット破棄）
+    func decryptIfEnabled(_ data: Data) -> Data? {
         guard isEnabled, hasKey else {
-            return data
+            return data  // 暗号化無効 or 鍵未設定 → そのまま返す
         }
         
         do {
             return try decrypt(data)
         } catch {
-            print("[CryptoManager] 復号エラー: \(error)")
-            return data  // 復号失敗時はそのまま返す
+            print("[CryptoManager] ❌ 復号失敗（パケット破棄）: \(error)")
+            return nil  // 破損パケットを破棄
         }
     }
     
@@ -174,19 +176,19 @@ class CryptoManager {
     
     // MARK: - Phase 3: ECDH鍵交換
     
-    /// ECDHプライベート鍵
-    private var ecdhPrivateKey: P256.KeyAgreement.PrivateKey?
+    /// ECDHプライベート鍵（Curve25519）
+    private var ecdhPrivateKey: Curve25519.KeyAgreement.PrivateKey?
     
-    /// ECDH鍵ペアを生成
+    /// ECDH鍵ペアを生成（Curve25519統一）
     func generateECDHKeyPair() -> Data {
-        let privateKey = P256.KeyAgreement.PrivateKey()
+        let privateKey = Curve25519.KeyAgreement.PrivateKey()
         ecdhPrivateKey = privateKey
         
-        // 公開鍵をエクスポート（圧縮形式）
+        // 公開鍵をエクスポート（rawRepresentation: 固定32バイト）
         let publicKey = privateKey.publicKey
-        let publicKeyData = publicKey.compressedRepresentation
+        let publicKeyData = publicKey.rawRepresentation
         
-        print("[CryptoManager] ECDH鍵ペア生成")
+        print("[CryptoManager] ECDH鍵ペア生成（Curve25519, \(publicKeyData.count)バイト）")
         return publicKeyData
     }
     
@@ -197,30 +199,30 @@ class CryptoManager {
         }
         
         do {
-            let peerPublicKey = try P256.KeyAgreement.PublicKey(compressedRepresentation: peerPublicKeyData)
+            let peerPublicKey = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: peerPublicKeyData)
             
             // 共有秘密を計算
             let sharedSecret = try privateKey.sharedSecretFromKeyAgreement(with: peerPublicKey)
             
-            // HKDF-SHA256で256ビット鍵を導出
+            // HKDF-SHA256で256ビット鍵を導出（KeyExchangeManagerと統一）
             let derivedKey = sharedSecret.hkdfDerivedSymmetricKey(
                 using: SHA256.self,
-                salt: Data("MyRemoteHost".utf8),
-                sharedInfo: Data("AES-256-GCM".utf8),
+                salt: "MyRemoteHost-v1".data(using: .utf8)!,
+                sharedInfo: Data(),
                 outputByteCount: 32
             )
             
             symmetricKey = derivedKey
             ecdhPrivateKey = nil  // 使用済みプライベート鍵を破棄
             
-            print("[CryptoManager] ✅ ECDH共有鍵導出成功")
+            print("[CryptoManager] ✅ ECDH共有鍵導出成功（Curve25519）")
         } catch {
             throw CryptoError.ecdhFailed
         }
     }
     
     /// ECDHハンドシェイクパケット生成
-    /// フォーマット: [0xEC] [33バイト: 圧縮公開鍵]
+    /// フォーマット: [0xEC] [32バイト: Curve25519公開鍵]
     func generateECDHHandshakePacket() -> Data {
         let publicKeyData = generateECDHKeyPair()
         
@@ -232,11 +234,11 @@ class CryptoManager {
     
     /// ECDHハンドシェイクを処理
     func processECDHHandshake(_ data: Data) throws {
-        guard data.count >= 34, data[0] == 0xEC else {
+        guard data.count >= 33, data[0] == 0xEC else {
             throw CryptoError.ecdhFailed
         }
         
-        let peerPublicKeyData = data.subdata(in: 1..<34)
+        let peerPublicKeyData = data.subdata(in: 1..<33)
         try deriveSharedKey(peerPublicKeyData: peerPublicKeyData)
     }
     

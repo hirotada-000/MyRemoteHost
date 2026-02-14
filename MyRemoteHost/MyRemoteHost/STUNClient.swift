@@ -95,9 +95,13 @@ public actor STUNClient {
     
     /// 単一のSTUNサーバーにクエリ
     private func querySTUNServer(host: String, port: UInt16) async throws -> STUNResult {
-        // UDPソケット作成
+        // UDPソケット作成（IPv4を強制 — STUNサーバーがIPv6を返さないようにする）
         let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!)
-        let connection = NWConnection(to: endpoint, using: .udp)
+        let params = NWParameters.udp
+        if let ipOptions = params.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
+            ipOptions.version = .v4
+        }
+        let connection = NWConnection(to: endpoint, using: params)
         
         return try await withCheckedThrowingContinuation { continuation in
             var hasResumed = false
@@ -218,6 +222,8 @@ public actor STUNClient {
         
         // Message Type確認
         let messageType = UInt16(data[0]) << 8 | UInt16(data[1])
+        Logger.stun("📦 Response: type=0x\(String(format: "%04X", messageType)), size=\(data.count)bytes")
+        
         guard messageType == STUNMessageType.bindingResponse.rawValue else {
             if messageType == STUNMessageType.bindingErrorResponse.rawValue {
                 throw STUNError.bindingError
@@ -241,6 +247,7 @@ public actor STUNClient {
             
             let attrType = UInt16(data[offset]) << 8 | UInt16(data[offset + 1])
             let attrLength = Int(UInt16(data[offset + 2]) << 8 | UInt16(data[offset + 3]))
+            Logger.stun("  Attr: type=0x\(String(format: "%04X", attrType)), len=\(attrLength)")
             offset += 4
             
             guard offset + attrLength <= data.count else { break }
@@ -250,13 +257,17 @@ public actor STUNClient {
                 if let result = parseXorMappedAddress(data: data, offset: offset, length: attrLength) {
                     publicIP = result.0
                     publicPort = result.1
+                    Logger.stun("  ✅ XOR-MAPPED-ADDRESS: \(result.0):\(result.1)")
                     break
+                } else {
+                    Logger.stun("  ⚠️ XOR-MAPPED-ADDRESS パース失敗 (family=\(attrLength >= 2 ? String(format: "0x%02X", data[offset+1]) : "N/A"))")
                 }
             } else if attrType == STUNAttributeType.mappedAddress.rawValue {
                 // MAPPED-ADDRESS（フォールバック）
                 if let result = parseMappedAddress(data: data, offset: offset, length: attrLength) {
                     publicIP = result.0
                     publicPort = result.1
+                    Logger.stun("  ✅ MAPPED-ADDRESS: \(result.0):\(result.1)")
                 }
             }
             
@@ -267,6 +278,7 @@ public actor STUNClient {
         }
         
         guard let ip = publicIP, let port = publicPort else {
+            Logger.stun("❌ マップされたアドレスが見つかりません (属性一覧をチェックしてください)", level: .error)
             throw STUNError.noMappedAddress
         }
         
@@ -286,6 +298,7 @@ public actor STUNClient {
         
         if family == 0x01 {
             // IPv4
+            guard length >= 8 else { return nil }
             let xorIP = UInt32(data[offset + 4]) << 24 |
                         UInt32(data[offset + 5]) << 16 |
                         UInt32(data[offset + 6]) << 8 |
@@ -293,6 +306,16 @@ public actor STUNClient {
             let ip = xorIP ^ stunMagicCookie
             let ipString = "\(ip >> 24 & 0xFF).\(ip >> 16 & 0xFF).\(ip >> 8 & 0xFF).\(ip & 0xFF)"
             return (ipString, port)
+        } else if family == 0x02 {
+            // IPv6 (RFC 5389: XOR with magic cookie + transaction ID)
+            guard length >= 20 else { return nil }
+            // IPv6アドレスの最初の4バイトはmagic cookieでXOR
+            // 残り12バイトはtransaction IDでXOR
+            // ただし、NAT越えの目的ではIPv4アドレスが必要なので、
+            // IPv6が返された場合はIPv4にフォールバックするためnilを返す
+            // （代わりに次のSTUNサーバーを試す）
+            Logger.stun("  ℹ️ IPv6アドレス検出 - IPv4フォールバックが必要", level: .warning)
+            return nil
         }
         
         return nil
@@ -309,6 +332,10 @@ public actor STUNClient {
             // IPv4
             let ip = "\(data[offset + 4]).\(data[offset + 5]).\(data[offset + 6]).\(data[offset + 7])"
             return (ip, port)
+        } else if family == 0x02 {
+            // IPv6 - 現在はスキップ
+            Logger.stun("  ℹ️ MAPPED-ADDRESS: IPv6はスキップ", level: .debug)
+            return nil
         }
         
         return nil

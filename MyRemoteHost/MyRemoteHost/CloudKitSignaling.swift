@@ -80,7 +80,7 @@ public struct HostDeviceRecord: Sendable {
         self.hostUserRecordID = record[Keys.hostUserRecordID] as? String ?? ""
         self.deviceName = record[Keys.deviceName] as? String ?? "Unknown"
         self.localIP = record[Keys.localIP] as? String ?? ""
-        self.localPort = record[Keys.localPort] as? Int ?? 5000
+        self.localPort = record[Keys.localPort] as? Int ?? Int(NetworkTransportConfiguration.default.videoPort)
         self.publicIP = record[Keys.publicIP] as? String
         self.publicPort = record[Keys.publicPort] as? Int
         self.isOnline = record[Keys.isOnline] as? Bool ?? false

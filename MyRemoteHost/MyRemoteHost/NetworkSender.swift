@@ -25,6 +25,8 @@ protocol NetworkSenderDelegate: AnyObject {
     func networkSender(_ sender: NetworkSender, didDisconnectClient endpoint: String, remainingClients: Int)
     /// 認証リクエスト受信（userRecordIDはApple ID判定用）
     func networkSender(_ sender: NetworkSender, didReceiveAuthRequest host: String, port: UInt16, userRecordID: String?)
+    /// ★ Phase 3: キーフレーム要求受信（クライアントからの自動要求）
+    func networkSenderDidReceiveKeyFrameRequest(_ sender: NetworkSender)
 }
 
 /// クライアント情報
@@ -51,6 +53,7 @@ class NetworkSender {
         case listening
         case ready
         case failed(Error)
+        case cancelled
     }
     
     /// パケットタイプ
@@ -60,10 +63,11 @@ class NetworkSender {
         case pps = 0x02
         case videoFrame = 0x03
         case keyFrame = 0x04
-        case jpegFrame = 0x05  // Deprecated (JPEG)
-        case pngFrame = 0x06   // ★ PNG 静止画フレーム
+
         case fecParity = 0x07  // ★ Phase 2: FECパリティブロック
         case metadata = 0x08   // ★ Phase 4: Retinaメタデータ
+        case handshake = 0x09  // ★ Phase 4: ECDHハンドシェイク
+        case omniscientState = 0x50 // ★ Phase 2: 全知全能ステート送信
     }
     
     // MARK: - Properties
@@ -82,7 +86,13 @@ class NetworkSender {
     let port: UInt16
     
     /// 最大パケットサイズ（MTU対応）
-    private let maxPacketSize = 1400
+    // ★ Phase 2.5: MTU対策で縮小 (1400 -> 1100)
+    // IPv6(40)+UDP(8)+TURN(4)+ChannelData(4)=56bytesヘッダ考慮
+    // 1100+56=1156 < 1280(IPv6最小MTU)
+    private let maxPacketSize = 1100
+    
+    /// ★ Phase 3: キーフレーム送信最小間隔（クールダウン 2.0秒）
+    private let minKeyFrameInterval: TimeInterval = 2.0
     
     /// UDP リスナー（登録受信用）
     private var listener: NWListener?
@@ -92,6 +102,9 @@ class NetworkSender {
     
     /// 登録済みクライアント
     private var clients: [String: ClientInfo] = [:]
+    
+    /// ★ R7修正: ハンドシェイク中のconnectionを追跡（二重登録による誤削除防止）
+    private var pendingConnections: [String: NWConnection] = [:]
     
     /// 送信キュー
     private let sendQueue = DispatchQueue(label: "com.myremotehost.networksender", qos: .userInteractive)
@@ -106,13 +119,57 @@ class NetworkSender {
     private let fecEncoder = FECEncoder()
     
     /// ★ Phase 2: FEC有効化フラグ
-    var fecEnabled: Bool = false  // ★ 一時無効化: デバッグ用
+    var fecEnabled: Bool = true
     
     /// ★ Phase 3: 暗号化マネージャー
     let cryptoManager = CryptoManager()
     
     /// ★ Phase 3: 暗号化有効化フラグ
-    var encryptionEnabled: Bool = false  // ★ 一時無効化: 鍵交換未実装のため
+    var encryptionEnabled: Bool = true
+    
+    // MARK: - ★ A-2: TURNリレーモード
+    
+    /// TURNクライアント（TURN relay経由送信用）
+    var turnClient: TURNClient?
+    
+    /// TURNモード有効化フラグ
+    var isTURNMode: Bool = false
+    
+    /// TURN送信先のpeerIP（iPhoneのrelayアドレス）
+    var turnPeerIP: String = ""
+    
+    /// TURN送信先のpeerPort（iPhoneのrelayポート）
+    var turnPeerPort: UInt16 = 0
+    
+    /// ★ KF TURN送信中フラグ（KF送信完了までPFを抑制）
+    private var isSendingKeyFrameViaTURN: Bool = false
+    
+    // MARK: - ★ Phase 3: アダプティブ・ペーシング
+    
+    /// EMA RTT（ミリ秒）
+    private var emaRttMs: Double = 2.0
+    private let rttAlpha: Double = 0.2
+    
+    /// RTTを更新（NetworkQualityMonitorから呼び出し）
+    func updateRTT(_ rttMs: Double) {
+        emaRttMs = emaRttMs * (1.0 - rttAlpha) + rttMs * rttAlpha
+    }
+    
+    /// アダプティブ・バッチサイズ（何パケットごとにウェイトを入れるか）
+    var adaptiveBatchSize: Int {
+        if emaRttMs <= 2.0  { return 20 }  // LAN内: 攻撃的
+        if emaRttMs <= 10.0 { return 15 }  // 近距離Wi-Fi
+        if emaRttMs <= 30.0 { return 10 }  // 通常ネットワーク
+        return 5                            // WAN: 慎重
+    }
+    
+    /// アダプティブ・ペーシング間隔（マイクロ秒）
+    var adaptivePacingUs: UInt32 {
+        if emaRttMs <= 2.0  { return 500 }   // LAN: 0.5ms
+        if emaRttMs <= 10.0 { return 800 }   // 近距離: 0.8ms
+        if emaRttMs <= 30.0 { return 1000 }  // 通常: 1ms
+        return 2000                           // WAN: 2ms
+    }
     
     // MARK: - ログ頻度制御
     
@@ -122,22 +179,10 @@ class NetworkSender {
     /// キーフレーム送信カウンター
     private var keyFrameSendCount = 0
     
-    /// PNG送信カウンター
-    private var pngSendCount = 0
+    /// 最後にキーフレームを送信した時刻
+    private var lastKeyFrameSendTime: Date?
     
-    /// ★ PNG送信中フラグ（動画フレーム送信を一時停止）
-    private var _isPNGSending = false
-    
-    /// ★ PNG送信排他制御用ロック
-    private let pngSendingLock = NSLock()
-    
-    /// ★ PNG送信中かどうか（スレッドセーフ）
-    var isPNGSending: Bool {
-        pngSendingLock.lock()
-        defer { pngSendingLock.unlock() }
-        return _isPNGSending
-    }
-    
+
     // MARK: - Initialization
     
     init(port: UInt16 = 5100) {
@@ -175,7 +220,7 @@ class NetworkSender {
                 Logger.network("❌ リスナー失敗: \(error)", level: .error)
                 
             case .cancelled:
-                self.state = .idle
+                self.state = .cancelled
                 // print("[NetworkSender] リスナーキャンセル")
                 
             default:
@@ -244,171 +289,48 @@ class NetworkSender {
     
     /// 映像フレームを送信
     func sendVideoFrame(_ data: Data, isKeyFrame: Bool, timestamp: UInt64) {
-        // ★ PNG送信中は動画フレームをスキップ（ソケット負荷軽減）
-        if isPNGSending {
+        // ★ TURN KF送信中のPF抑制: KF送信完了まで新しいPFを送らない
+        // KF（~200ms、164チャンク）送信中にPFを並行送信すると、
+        // iPhone側でVideoDecoderがwaitingForKeyFrame状態のためPFが全てスキップされる
+        if isTURNMode && !isKeyFrame && isSendingKeyFrameViaTURN {
+            // KF送信完了後に自然にエンコーダから新PFが来るので、ここでは静かにスキップ
             return
+        }
+        
+        // ★ Phase 3: キーフレーム送信クールダウン
+        // どんなに要求があっても、2秒間は次のKFを送らない（帯域保護）
+        if isKeyFrame {
+            if let lastTime = lastKeyFrameSendTime, Date().timeIntervalSince(lastTime) < minKeyFrameInterval {
+                Logger.network("⏳ KF送信スキップ (クールダウン中)")
+                return
+            }
+            lastKeyFrameSendTime = Date()
+            keyFrameSendCount += 1
         }
         
         let type: PacketType = isKeyFrame ? .keyFrame : .videoFrame
-        if isKeyFrame {
-            keyFrameSendCount += 1
-            if keyFrameSendCount == 1 || keyFrameSendCount % 100 == 0 {
-                // print("[NetworkSender] キーフレーム送信: \(data.count)バイト (累計\(keyFrameSendCount)回)")
-            }
-        }
         sendPacket(type: type, data: data, timestamp: timestamp)
     }
     
-    /// ★ PNG 静止画フレームを送信（強化ペーシング・排他制御付き）
-    func sendPNGFrame(_ data: Data) {
-        // ★ スレッドセーフに送信中フラグをチェック・セット
-        pngSendingLock.lock()
-        if _isPNGSending {
-            pngSendingLock.unlock()
-            // print("[NetworkSender] ⚠️ PNG送信中のため新規送信スキップ")
-            return
-        }
-        _isPNGSending = true
-        pngSendingLock.unlock()
-        
-        // ★ PNG送信前に100ms待機（エンコーダ再構成直後の接続安定化）
-        sendQueue.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-            guard let self = self else { return }
-            self.sendPacketWithStrongPacingSync(type: .pngFrame, data: data, timestamp: UInt64(Date().timeIntervalSince1970 * 1000))
-            
-            // ★ PNG送信完了 → フラグ解除（スレッドセーフ）
-            self.pngSendingLock.lock()
-            self._isPNGSending = false
-            self.pngSendingLock.unlock()
-            
-            // print("[NetworkSender] ✅ PNG送信完了: \(self.pngSendCount)回目")
-            
-            // ★ PNG送信完了後に接続状態を確認し、必要なら再確立
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                self.reconnectFailedClients()
-            }
+    /// ★ Phase 4: ECDHハンドシェイク（公開鍵）を送信
+    func sendHandshake(_ publicKey: Data) {
+        Logger.network("🔐 ハンドシェイク送信: \(publicKey.count)バイト")
+        sendPacket(type: .handshake, data: publicKey, timestamp: 0)
+    }
+    
+    /// ★ Phase 2: 全知全能ステートを送信
+    func sendOmniscientState(_ state: OmniscientState) {
+        do {
+            let data = try JSONEncoder().encode(state)
+            // ステートは頻繁に送るためログは出さない
+            sendPacket(type: .omniscientState, data: data, timestamp: 0)
+        } catch {
+            print("[NetworkSender] ⚠️ OmniscientStateエンコード失敗: \(error)")
         }
     }
     
-    /// ★ 接続がfailed状態のクライアントを再接続
-    private func reconnectFailedClients() {
-        sendQueue.async { [weak self] in
-            guard let self = self else { return }
-            
-            for (key, client) in self.clients {
-                guard let connection = client.connection else { continue }
-                
-                // ★ failed状態の接続を検出
-                if case .failed = connection.state {
-                    // print("[NetworkSender] 🔄 接続再確立開始: \(key)")
-                    
-                    // 古い接続をキャンセル
-                    connection.cancel()
-                    
-                    // 新しい接続を作成
-                    let endpoint = NWEndpoint.hostPort(
-                        host: NWEndpoint.Host(client.host),
-                        port: NWEndpoint.Port(rawValue: client.port)!
-                    )
-                    
-                    let newConnection = NWConnection(to: endpoint, using: .udp)
-                    newConnection.stateUpdateHandler = { [weak self] newState in
-                        switch newState {
-                        case .ready:
-                            break // 接続再確立成功
-                        case .failed:
-                            break // 接続再確立失敗
-                        default:
-                            break
-                        }
-                    }
-                    
-                    client.connection = newConnection
-                    newConnection.start(queue: self.sendQueue)
-                }
-            }
-        }
-    }
+    // ★ 動画一本化: sendPNGFrame / sendPacketWithStrongPacingSync / reconnectFailedClients は廃止
     
-    /// ★ 強化ペーシングでパケット送信（PNG等の大きなフレーム用）- 同期版
-    private func sendPacketWithStrongPacingSync(type: PacketType, data: Data, timestamp: UInt64) {
-        // 既にsendQueue上で実行されている前提
-        guard !self.clients.isEmpty else { return }
-        
-        let headerSize = 1 + 8 + 4 + 4
-        let maxDataPerPacket = self.maxPacketSize - headerSize
-        let totalPackets = (data.count + maxDataPerPacket - 1) / maxDataPerPacket
-        
-        self.pngSendCount += 1
-        if self.pngSendCount == 1 || self.pngSendCount % 100 == 0 {
-            // print("[NetworkSender] 📤 PNG送信開始: \(data.count)バイト → \(totalPackets)パケット (累計\(self.pngSendCount)回)")
-        }
-        
-        // ★ 送信エラーカウント（ログ抑制用）
-        var errorCount = 0
-        
-        for i in 0..<totalPackets {
-            // ★★ 超・超強化ペーシング: 3パケットごとに50msウェイト（接続保護最優先）
-            if i > 0 && i % 3 == 0 {
-                usleep(50000)  // 50ms
-            }
-            
-            let start = i * maxDataPerPacket
-            let end = min(start + maxDataPerPacket, data.count)
-            let chunk = data[start..<end]
-            
-            var packet = Data()
-            packet.append(type.rawValue)
-            
-            var ts = timestamp.bigEndian
-            packet.append(Data(bytes: &ts, count: 8))
-            
-            var total = UInt32(totalPackets).bigEndian
-            packet.append(Data(bytes: &total, count: 4))
-            
-            var index = UInt32(i).bigEndian
-            packet.append(Data(bytes: &index, count: 4))
-            
-            packet.append(chunk)
-            
-            for (key, client) in self.clients {
-                guard let connection = client.connection else { continue }
-                
-                // ★ 接続状態を確認
-                // .ready 以外（failed, waiting, cancelled）では送信しないことでシステムログを抑制
-                if connection.state != .ready {
-                    // failedの場合は再接続を試みる（非同期）
-                    if case .failed = connection.state {
-                        DispatchQueue.global().async {
-                           self.reconnectFailedClients()
-                        }
-                    }
-                    continue
-                }
-                
-                connection.send(content: packet, completion: .contentProcessed { [weak self] error in
-                    if let error = error {
-                        errorCount += 1
-                        // ★ エラーログは最初の1回のみ
-                        if errorCount == 1 {
-                             // print("[NetworkSender] ⚠️ PNG送信エラー: \(error.localizedDescription)")
-                             // エラー発生時は再接続を試みる
-                             self?.reconnectFailedClients()
-                        }
-                    }
-                })
-            }
-        }
-        
-        if self.pngSendCount == 1 || self.pngSendCount % 100 == 0 {
-            // print("[NetworkSender] ✅ PNG送信完了: \(totalPackets)パケット (累計\(self.pngSendCount)回)")
-        }
-        
-        // ★ エラーがあった場合のサマリーログ
-        if errorCount > 0 {
-            // print("[NetworkSender] ⚠️ PNG送信中のエラー: \(errorCount)件")
-        }
-    }
     
     /// 接続クライアント数
     var clientCount: Int {
@@ -458,11 +380,18 @@ class NetworkSender {
                         self.unregisterClient(host: hostString)
                     }
                 }
+                // ★ Phase 3: キーフレーム要求パケット: [0xFC]
+                else if data[0] == 0xFC {
+                    Logger.pipeline("★ キーフレーム要求受信")
+                    DispatchQueue.main.async {
+                        self.delegate?.networkSenderDidReceiveKeyFrameRequest(self)
+                    }
+                }
                 // 登録パケット: [0xFE] [2バイト: ポート] [userRecordID(UTF-8)]
                 else if data[0] == 0xFE && data.count >= 3 {
-                    Logger.network("🔔 登録パケット受信: \(data.count)バイト")  // ★ デバッグログ
+                    Logger.network("🔔 登録パケット受信: \(data.count)バイト", sampling: .oncePerSession)  // 初回のみ
                     let clientPort = UInt16(bigEndian: data.subdata(in: 1..<3).withUnsafeBytes {
-                        $0.load(as: UInt16.self)
+                        $0.loadUnaligned(fromByteOffset: 0, as: UInt16.self)
                     })
                     
                     // ★ Phase 3: userRecordIDを抽出（3バイト以降）
@@ -516,8 +445,15 @@ class NetworkSender {
         
         // 既に登録済みの場合はスキップ
         if clients[key] != nil {
-            // print("[NetworkSender] クライアント既に登録済み: \(key)")
+            Logger.network("⚠️ クライアント既に登録済み: \(key) - approveスキップ")
             return
+        }
+        
+        // ★ R7修正: ハンドシェイク中の場合、古い接続をキャンセルして新しい接続で上書き
+        if let existingPending = pendingConnections[key] {
+            Logger.network("⚠️ 二重登録検出: \(key) - 古いハンドシェイク接続をキャンセル")
+            existingPending.cancel()
+            pendingConnections.removeValue(forKey: key)
         }
         
         // クライアント接続を確立
@@ -530,39 +466,37 @@ class NetworkSender {
         
         let connection = NWConnection(to: endpoint, using: .udp)
         
+        // ★ R7修正: pendingConnectionsにこの接続を追跡
+        pendingConnections[key] = connection
+        
         connection.stateUpdateHandler = { [weak self] newState in
             switch newState {
             case .ready:
-                self?.clients[key] = clientInfo
-                self?.state = .ready
+                Logger.network("🟡 UDP接続確立 - ハンドシェイク開始: \(key)")
                 
-                // print("[NetworkSender] ✅ クライアント認証許可: \(key)")
-                
-                // ★ Phase 3: 暗号化鍵を生成（初回接続時のみ）
-                if let sender = self, !sender.cryptoManager.hasKey {
-                    sender.cryptoManager.generateKey()
-                    // print("[NetworkSender] 🔐 暗号化鍵生成完了（AES-256）")
-                }
-                
-                // ★ 重要: デリゲート呼び出し→オンデマンドキャプチャ開始→SPS/PPS生成 を待ってから認証成功通知
-                DispatchQueue.main.async {
-                    self?.delegate?.networkSender(self!, didConnectToClient: key)
+                // ★ ECDHハンドシェイク開始
+                if let sender = self {
+                    let handshakePayload = sender.cryptoManager.generateECDHHandshakePacket()
+                    sender.sendHandshake(handshakePayload, to: connection)
                     
-                    // ★ オンデマンドキャプチャ開始とSPS/PPS生成を待つ時間を確保
-                    // didConnectToClient内でstartCapture()が呼ばれ、SPS/PPSが生成される
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                        // 認証成功をクライアントに通知（オンデマンドキャプチャ開始後）
-                        self?.sendAuthResult(approved: true, to: connection)
-                        // print("[NetworkSender] 📤 認証成功通知送信: \(key)")
-                    }
+                    // Clientからのハンドシェイクを待機し、完了したら登録を行う
+                    sender.receiveHandshakeAndCompleteConnection(connection, clientInfo: clientInfo, key: key)
                 }
                 
             case .failed(let error):
-                // print("[NetworkSender] クライアント接続失敗: \(key) - \(error)")
+                Logger.network("❌ クライアント接続失敗: \(key) - \(error)", level: .error)
+                self?.pendingConnections.removeValue(forKey: key)
                 clientInfo.connection?.cancel()
             case .cancelled:
-                self?.clients.removeValue(forKey: key)
-                // print("[NetworkSender] クライアント接続キャンセル: \(key)")
+                // ★ R7修正: 現在のconnectionが登録済みクライアントのものと一致する場合のみ削除
+                // 二重登録時に古い接続のキャンセルが新しい正常な登録を誤削除するのを防止
+                if let currentClient = self?.clients[key], currentClient.connection === connection {
+                    self?.clients.removeValue(forKey: key)
+                    Logger.network("🔌 クライアント切断(cancelled): \(key)")
+                } else {
+                    Logger.network("⚠️ 古い接続のキャンセル検出: \(key) - クライアント保持")
+                }
+                self?.pendingConnections.removeValue(forKey: key)
             default:
                 break
             }
@@ -571,6 +505,98 @@ class NetworkSender {
         clientInfo.connection = connection
         connection.start(queue: sendQueue)
     }
+    
+    /// ★ Phase 4: ハンドシェイク受信待機と接続完了処理
+    private func receiveHandshakeAndCompleteConnection(_ connection: NWConnection, clientInfo: ClientInfo, key: String) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 1024) { [weak self] content, context, isComplete, error in
+            guard let self = self else { return }
+            
+            if let error = error {
+                Logger.network("❌ ハンドシェイク受信エラー: \(error)", level: .error)
+                return
+            }
+            
+            if let data = content, data.count > 17 {
+                let typeByte = data[0]
+                // ハンドシェイクパケット (0x09) かつ ヘッダー(17) + 鍵(32) = 49バイト以上
+                if typeByte == 0x09 {
+                    let keyData = data.subdata(in: 17..<data.count)
+                    do {
+                        Logger.network("🔐 ハンドシェイク受信(Client->Server): \(keyData.count) bytes")
+                        try self.cryptoManager.processECDHHandshake(keyData)
+                        Logger.network("✅ E2E暗号化接続 確立完了 (Server)")
+                        
+                        // ★ ハンドシェイク成功！ここで初めてクライアント登録とデリゲート通知を行う
+                        DispatchQueue.main.async {
+                            self.completeClientRegistration(clientInfo: clientInfo, key: key, connection: connection)
+                        }
+                        
+                        // 以降は通常の受信ループへ（もしあれば）
+                        // self.receiveFromClient(connection) 
+                        // 現状UDP受信はハンドシェイク以外想定していないが、将来のために閉じておくかループするか？
+                        // とりあえず終了。
+                        return
+                        
+                    } catch {
+                        Logger.network("❌ ハンドシェイク処理失敗: \(error)", level: .error)
+                        connection.cancel()
+                        return
+                    }
+                }
+            }
+            
+            // まだハンドシェイクが来ていない、または不完全な場合
+            if !isComplete {
+                self.receiveHandshakeAndCompleteConnection(connection, clientInfo: clientInfo, key: key)
+            }
+        }
+    }
+    
+    /// ★ Phase 4: クライアント登録完了処理
+    private func completeClientRegistration(clientInfo: ClientInfo, key: String, connection: NWConnection) {
+        // ★ R7修正: pendingからclientsへ昇格
+        self.pendingConnections.removeValue(forKey: key)
+        self.clients[key] = clientInfo
+        self.state = .ready
+        
+        Logger.network("✅ クライアント正式登録: \(key) (connState: \(connection.state), clients: \(self.clients.count))")
+        
+        // デリゲート呼び出し
+        self.delegate?.networkSender(self, didConnectToClient: key)
+        
+        // 認証成功通知 (TCP) — registrationConnection経由で送信
+        // ★ クライアントはTCP serverConnectionで0xAAを待機しているため、
+        //    UDP connectionではなくTCP registrationConnectionに送信する必要がある
+        if let tcpConnection = self.registrationConnection {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                self.sendAuthResult(approved: true, to: tcpConnection)
+                Logger.network("📤 認証成功通知送信 (TCP)")
+            }
+        } else {
+            Logger.network("⚠️ TCP registrationConnectionが無い - 認証通知送信不可", level: .error)
+        }
+    }
+    
+    /// ★ Phase 4: 特定の接続にハンドシェイク送信
+    private func sendHandshake(_ payload: Data, to connection: NWConnection) {
+        Logger.network("🔐 ハンドシェイク送信(Server->Client): \(payload.count)バイト")
+        
+        // ヘッダー作成 (タイプ + タイムスタンプ + 総数 + 番号)
+        var packet = Data()
+        packet.append(PacketType.handshake.rawValue)
+        var ts: UInt64 = 0
+        packet.append(Data(bytes: &ts, count: 8))
+        var total: UInt32 = 1
+        packet.append(contentsOf: Data(bytes: &total, count: 4).reversed()) // bigEndian
+        var index: UInt32 = 0
+        packet.append(contentsOf: Data(bytes: &index, count: 4).reversed()) // bigEndian
+        
+        packet.append(payload) // 既に 0xEC 付き
+        
+        connection.send(content: packet, completion: .contentProcessed { _ in })
+    }
+    
+
     
     /// クライアント接続を拒否
     func denyClient(host: String, port: UInt16) {
@@ -684,27 +710,59 @@ class NetworkSender {
     private func sendPacket(type: PacketType, data: Data, timestamp: UInt64) {
         // メインスレッドをブロックしないよう、送信キューで実行
         sendQueue.async { [weak self] in
-            guard let self = self, !self.clients.isEmpty else { return }
+            guard let self = self else { return }
+            
+            // ★ A-2修正: TURNモード時はクライアントリスト不要（relay経由で送信）
+            guard self.isTURNMode || !self.clients.isEmpty else {
+                // ★ 診断ログ: クライアントがいない場合
+                if type == .keyFrame || type == .vps || type == .sps || type == .pps {
+                    Logger.network("⚠️ sendPacketスキップ: クライアントなし type=\(type)", level: .warning)
+                }
+                return
+            }
             
             // パケットヘッダー作成
             // [1バイト: タイプ] [8バイト: タイムスタンプ] [4バイト: 総パケット数] [4バイト: パケット番号] [データ]
+            
+            // ★ Phase 4: 暗号化 (ハンドシェイク以外)
+            var payload = data
+            if type != .handshake {
+                // debugLogPacket(data, label: "Plain")
+                guard let encrypted = self.cryptoManager.encryptIfEnabled(data) else {
+                    print("[NetworkSender] ⚠️ 暗号化失敗のためパケット送信をスキップ")
+                    return
+                }
+                payload = encrypted
+                // debugLogPacket(payload, label: "Encrypted")
+                
+                // 暗号化によりサイズが増加するため、ログ出力（デバッグ用）
+                // if payload.count != data.count { print("🔒 Encrypted: \(data.count) -> \(payload.count) bytes") }
+            }
+            
             let headerSize = 1 + 8 + 4 + 4
             let maxDataPerPacket = self.maxPacketSize - headerSize
             
             // データを分割
-            let totalPackets = (data.count + maxDataPerPacket - 1) / maxDataPerPacket
+            let totalPackets = (payload.count + maxDataPerPacket - 1) / maxDataPerPacket
+            
+            // ★ TURN送信: 全チャンクを先に構築してから1つのTaskで順次送信
+            //   個別Task作成だとキーフレーム(複数チャンク)の途中にP-frame Taskが挟まり、
+            //   iPhone側でキーフレーム再構築が失敗する
+            var turnPackets: [Data] = []
             
             for i in 0..<totalPackets {
-                // ★ UDPバースト制御 (Pacing)
-                // 10パケットごとに 1ms のウェイトを入れ、ルーターやOSバッファの溢れを防ぐ
-                // 特に巨大なPNG転送時に必須
-                if i > 0 && i % 10 == 0 {
-                    usleep(1000)
+                // ★ Phase 3: アダプティブ・ペーシング（RTTベース）
+                // TURN経由ではペーシング不要（actorが逐次送信するため）
+                if !self.isTURNMode {
+                    let batchSize = self.adaptiveBatchSize
+                    if i > 0 && i % batchSize == 0 {
+                        usleep(self.adaptivePacingUs)
+                    }
                 }
                 
                 let start = i * maxDataPerPacket
-                let end = min(start + maxDataPerPacket, data.count)
-                let chunk = data[start..<end]
+                let end = min(start + maxDataPerPacket, payload.count)
+                let chunk = payload[start..<end]
                 
                 var packet = Data()
                 
@@ -726,25 +784,85 @@ class NetworkSender {
                 // データ
                 packet.append(chunk)
                 
-                // 全クライアントに送信（.ready状態のみ）
-                for (key, client) in self.clients {
-                    guard let connection = client.connection else {
-                        continue
+                // ★ TURN/通常の分岐
+                if self.isTURNMode {
+                    turnPackets.append(packet)
+                } else {
+                    // 通常: 全クライアントに直接UDP送信（.ready状態のみ）
+                    for (key, client) in self.clients {
+                        guard let connection = client.connection else {
+                            continue
+                        }
+                        
+                        // ★ 接続状態を確認
+                        // .ready 以外では送信しない
+                        if connection.state != .ready {
+                            continue
+                        }
+                        
+                        connection.send(content: packet, completion: .contentProcessed { error in
+                            if let error = error {
+                                Logger.network("❌ UDP送信エラー: \(key) - \(error)", level: .error)
+                            }
+                        })
                     }
-                    
-                    // ★ 接続状態を確認
-                    // .ready 以外では送信しない
-                    if connection.state != .ready {
-                        continue
+                }
+            }
+            
+            // ★ TURN送信: 1つのTaskで全チャンクを順次送信（順序保証）
+            if self.isTURNMode, !turnPackets.isEmpty, let turnClient = self.turnClient {
+                let peerIP = self.turnPeerIP
+                let peerPort = self.turnPeerPort
+                let packetType = type
+                let packetCount = turnPackets.count
+                let totalBytes = turnPackets.reduce(0) { $0 + $1.count }
+                
+                // ★ Phase 0 診断: 送信開始ログ（KF/PF両方）
+                if packetType == .keyFrame {
+                    Logger.network("📤 TURN KF送信開始: \(packetCount)チャンク, \(totalBytes)バイト")
+                    self.isSendingKeyFrameViaTURN = true  // ★ KF送信中フラグON
+                } else {
+                    Logger.network("📤 TURN PF送信: \(packetCount)チャンク, \(totalBytes)バイト [type=\(packetType)]")
+                }
+                
+                Task {
+                    let startTime = CFAbsoluteTimeGetCurrent()
+                    do {
+                        for (idx, pkt) in turnPackets.enumerated() {
+                            try await turnClient.sendData(pkt, to: peerIP, peerPort: peerPort)
+                            
+                            // ★ 最適化 1-C: 適応型ペーシング（PF/KF分離）
+                            // PF（1-5チャンク）: ペーシング不要 → 即時送信で遅延最小化
+                            // KF（100-200チャンク）: 4チャンク毎0.5ms → 旧(2毎×1ms=80ms)比60%短縮
+                            if packetType == .keyFrame && idx > 0 && idx % 4 == 0 {
+                                try? await Task.sleep(nanoseconds: 500_000) // 0.5ms（KFのみ）
+                            }
+                            // PF: ペーシングなし（即時全チャンク送信）
+                        }
+                        let elapsed = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
+                        // ★ KF送信完了 → PF抑制解除
+                        if packetType == .keyFrame {
+                            self.isSendingKeyFrameViaTURN = false  // ★ KF送信中フラグOFF
+                            Logger.network("✅ TURN KF送信完了: \(packetCount)チャンク, \(totalBytes)バイト, \(String(format: "%.1f", elapsed))ms → PF抑制解除")
+                        } else {
+                            Logger.network("✅ TURN PF送信完了: \(packetCount)チャンク, \(String(format: "%.1f", elapsed))ms")
+                        }
+                    } catch {
+                        Logger.network("❌ TURN送信エラー (\(packetType)): \(error)", level: .error)
                     }
-                    
-                    connection.send(content: packet, completion: .contentProcessed { error in
-                        // ★ エラー時もクライアントを即座に削除しない
-                        // ハートビートタイムアウトで自然にクリーンアップされる
-                        // 一時的なエラーからの復帰を可能にする
-                    })
                 }
             }
         }
+    }
+    
+    // MARK: - Debug
+    
+    /// ★ 暗号化検証用パケットダンプ
+    private func debugLogPacket(_ data: Data, label: String) {
+        // 最初の32バイトだけ表示
+        let count = min(data.count, 32)
+        let subdata = data.subdata(in: 0..<count)
+        let hex = subdata.map { String(format: "%02X", $0) }.joined(separator: " ")
+        // Logger.network("🔍 [PacketDump] \(label): \(hex) ...Total:\(data.count)")
     }
 }

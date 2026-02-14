@@ -10,6 +10,7 @@ import CoreMedia
 import CoreVideo
 import Combine
 import UIKit
+import SwiftUI
 
 /// 保存済みホスト情報
 struct SavedHost: Codable, Identifiable, Equatable {
@@ -37,13 +38,14 @@ class RemoteViewModel: ObservableObject {
     @Published var isConnected = false
     @Published var isConnecting = false
     @Published var hostAddress: String = ""
-    @Published var port: String = "5000"
+    @Published var port: String = "\(NetworkTransportConfiguration.default.videoPort)"
     @Published var connectionError: String?
     @Published var frameRate: Double = 0
     @Published var decodedFrameCount: Int = 0
     
     /// 受信したPNGデータ（静止画モード用）
     @Published var currentPNGData: Data?
+
     
     /// 認証待機中
     @Published var isWaitingForAuth = false
@@ -60,12 +62,27 @@ class RemoteViewModel: ObservableObject {
     /// ★ Phase 1: ホスト発見中
     @Published var isDiscoveringHosts = false
     
+    /// ★ Phase 2: 全知全能ステート（HUD表示用）
+    @Published var currentOmniscientState: OmniscientState?
+    
+    /// ★ Phase 2: HUD表示フラグ（デフォルトON）
+    @Published var showHUD = true
+    
     // MARK: - Components
     
     let networkReceiver = NetworkReceiver()
     let decoder = VideoDecoder()
     let previewCoordinator = PreviewViewCoordinator()
+
     let inputSender = InputSender()
+    let deviceSensor = DeviceSensor()  // ★ Phase 1: デバイスセンサー
+    
+    /// バックグラウンド遷移前の接続情報
+    private var backgroundConnectionInfo: (host: String, port: String)?
+    
+    /// Notification購読
+    private var backgroundObserver: NSObjectProtocol?
+    private var foregroundObserver: NSObjectProtocol?
     
     // MARK: - Private Properties
     
@@ -75,11 +92,32 @@ class RemoteViewModel: ObservableObject {
     private var fpsTimer: Timer?
     private let savedHostsKey = "savedHosts"
     
+    // MARK: - Pipeline Latency Measurement (Phase 1)
+    /// フレーム受信時刻（デコード前）
+    private var lastReceiveTimestamp: CFAbsoluteTime = 0
+    /// デコード開始時刻
+    private var lastDecodeStartTimestamp: CFAbsoluteTime = 0
+    /// EMA計測値
+    private var emaReceiveToDecodeMs: Double = 0
+    private var emaDecodeDurationMs: Double = 0
+    private var emaRenderMs: Double = 0
+    private var emaNetworkTransitMs: Double = 0
+    private let emaAlpha: Double = 0.1
+    /// 最後のレンダー時刻
+    private var lastRenderTimestamp: CFAbsoluteTime = 0
+    
     // ★ 接続診断用プロパティ
     private var connectionTimeoutTimer: Timer?
     private var connectionRetryCount = 0
     private let maxRetryCount = 3
-    private let connectionTimeout: TimeInterval = 5.0
+    /// ★ B-1: TURN relayを考慮した接続タイムアウト（15秒）
+    private let connectionTimeout: TimeInterval = 15.0
+    
+    /// ★ B-1: TURN接続進行中フラグ（disconnect()をブロック）
+    private var isTURNInProgress: Bool = false
+    
+    /// ★ B-1: P2Pマネージャー保持（TURN状態維持用）
+    private var activeP2PManager: P2PConnectionManager?
     
     // MARK: - Initialization
     
@@ -87,6 +125,78 @@ class RemoteViewModel: ObservableObject {
         setupDelegates()
         loadSavedHosts()
         networkReceiver.prefetchUserRecordID()  // ★ Phase 3: userRecordIDを事前取得
+        setupLifecycleObservers()
+    }
+    
+    deinit {
+        if let observer = backgroundObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        if let observer = foregroundObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+    }
+    
+    // MARK: - Lifecycle Management
+    
+    private func setupLifecycleObservers() {
+        backgroundObserver = NotificationCenter.default.addObserver(
+            forName: .appDidEnterBackground,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleBackgroundTransition()
+        }
+        
+        foregroundObserver = NotificationCenter.default.addObserver(
+            forName: .appDidBecomeActive,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleForegroundTransition()
+        }
+    }
+    
+    /// バックグラウンド遷移: リソース解放
+    func handleBackgroundTransition() {
+        Logger.app("📱 バックグラウンド: リソース解放開始")
+        
+        // 接続情報を保存（復帰時に使用）
+        if isConnected {
+            backgroundConnectionInfo = (host: hostAddress, port: port)
+        }
+        
+        // デコーダー停止（VTDecompressionSession解放）
+        decoder.teardown()
+        
+        // FPSモニタリング停止
+        stopFPSMonitoring()
+        
+        // ネットワーク切断（バッテリー消費防止）
+        networkReceiver.disconnect()
+        inputSender.disconnect()
+        
+        isConnected = false
+        isConnecting = false
+        
+        Logger.app("📱 バックグラウンド: リソース解放完了")
+    }
+    
+    /// フォアグラウンド復帰: 再接続
+    func handleForegroundTransition() {
+        Logger.app("📱 フォアグラウンド復帰: 再接続開始")
+        
+        // バックグラウンド前に接続していた場合のみ再接続
+        if let info = backgroundConnectionInfo {
+            hostAddress = info.host
+            port = info.port
+            backgroundConnectionInfo = nil
+            
+            // 少し遅延して再接続（UI安定化のため）
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.connect()
+            }
+        }
     }
     
     // MARK: - Zoom State
@@ -126,7 +236,7 @@ class RemoteViewModel: ObservableObject {
     
     // MARK: - Public Methods
     
-    /// ホストに接続
+    /// ホストに接続（スマート接続：直接 -> CloudKit/TURNフォールバック）
     func connect() {
         guard !hostAddress.isEmpty else {
             connectionError = "ホストアドレスを入力してください"
@@ -143,13 +253,52 @@ class RemoteViewModel: ObservableObject {
         isWaitingForAuth = true  // 認証待機状態
         authDenied = false
         
-        Logger.shared.connectionStart()  // ★ ログ追加
-        Logger.network("接続開始: \(hostAddress):\(portNumber) (リトライ: \(connectionRetryCount)/\(maxRetryCount))")
+        Logger.shared.connectionStart()
+        Logger.network("🚀 スマート接続開始: \(hostAddress):\(portNumber)")
         
+        // 1. まずは直接接続を試みる（LAN内最速）
         networkReceiver.connect(to: hostAddress, port: portNumber)
-        inputSender.connect(to: hostAddress)  // 入力送信も接続
+        inputSender.connect(to: hostAddress)
+        deviceSensor.startMonitoring()
         
-        // ★ InputSender経由で登録パケット送信（少し待ってから）
+        // 2. 並行してCloudKitから当該ホストのICE候補を探す（NAT越え準備）
+        // ★ Step 2最適化: ICE候補取得後、直接接続が未完了なら即座にICE接続を並行開始
+        if isPrivateIP(hostAddress) {
+            Task {
+                Logger.network("🔄 LAN内IP(\(hostAddress))を検出。CloudKitでICE候補を検索中...")
+                do {
+                    // CloudKit上の全ホストを取得
+                    let hosts = try await CloudKitSignalingManager.shared.discoverMyHosts()
+                    
+                    // IPが一致する、または最新のホストを探す
+                    if let targetHost = hosts.first(where: { $0.connectionAddress == hostAddress }) ?? hosts.first {
+                        Logger.network("✅ 対応するCloudKitホストを発見: \(targetHost.deviceName)")
+                        
+                        // ICE候補を取得
+                        let candidates = try await CloudKitSignalingManager.shared.fetchICECandidates(for: targetHost)
+                        Logger.p2p("📥 バックグラウンドICE候補取得: \(candidates.count)件")
+                        
+                        if !candidates.isEmpty {
+                            await MainActor.run {
+                                self.cachedICECandidates = candidates
+                                
+                                // ★ Step 2: 直接接続が未完了なら、ICE候補で即座に並行接続開始
+                                // Starbucks等の異なるNAT環境では直接TCP接続が不可能なため、
+                                // 5秒タイムアウトを待たずにICE候補（P2P/TURN）を試行
+                                if !self.isConnected && self.isWaitingForAuth {
+                                    Logger.network("🚀 直接接続未完了 → ICE候補(\(candidates.count)件)で並行NAT越え接続開始")
+                                    self.connectWithICE(candidates: candidates)
+                                }
+                            }
+                        }
+                    }
+                } catch {
+                    Logger.network("⚠️ CloudKitホスト検索失敗: \(error.localizedDescription)")
+                }
+            }
+        }
+        
+        // 登録パケット送信
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self = self else { return }
             let listenPort = self.networkReceiver.listenPort
@@ -157,20 +306,36 @@ class RemoteViewModel: ObservableObject {
             self.inputSender.sendRegistration(listenPort: listenPort, userRecordID: userRecordID)
         }
         
-        // ★ 接続タイムアウト検知
+        // 接続タイムアウト検知
         startConnectionTimeout()
-        
         startFPSMonitoring()
     }
     
+    /// プライベートIPかどうか判定
+    private func isPrivateIP(_ ip: String) -> Bool {
+        return ip.hasPrefix("192.168.") || ip.hasPrefix("10.") || ip.hasPrefix("172.")
+    }
+    
+    /// 取得したICE候補（リトライ用キャッシュ）
+    private var cachedICECandidates: [ICECandidate] = []
+    
     /// 切断
     func disconnect() {
+        // ★ B-1: TURN接続進行中は切断をブロック
+        if isTURNInProgress {
+            Logger.pipeline("⏸️ TURN接続進行中のため切断を保留", sampling: .always)
+            return
+        }
+        
+        Logger.pipeline("★ 切断処理開始 (connected=\(isConnected), connecting=\(isConnecting))", sampling: .always)
+        
         // ★ タイマークリア
         cancelConnectionTimeout()
         connectionRetryCount = 0
         
         networkReceiver.disconnect()
         inputSender.disconnect()  // 入力送信も切断
+        deviceSensor.stopMonitoring() // ★ Phase 1
         decoder.teardown()
         previewCoordinator.flush()
         
@@ -179,6 +344,8 @@ class RemoteViewModel: ObservableObject {
         isConnecting = false
         decodedFrameCount = 0
         frameRate = 0
+        
+        Logger.pipeline("★ 切断処理完了", sampling: .always)
     }
     
     /// 保存済みホストに接続
@@ -296,6 +463,8 @@ class RemoteViewModel: ObservableObject {
     private func setupDelegates() {
         networkReceiver.delegate = self
         decoder.delegate = self
+        deviceSensor.delegate = self  // ★ Phase 1
+        inputSender.delegate = self    // ★ UDP認証結果受信用
     }
     
     /// 現在の接続先を保存
@@ -350,6 +519,10 @@ class RemoteViewModel: ObservableObject {
             Task { @MainActor in
                 guard let self = self else { return }
                 self.frameRate = Double(self.frameCount)
+                // ★ 0FPS警告（接続中のみ）
+                if self.frameCount == 0 && self.isConnected {
+                    Logger.pipeline("⚠️ FPS=0 検出 (接続中なのに映像なし) decoded=\(self.decodedFrameCount)", level: .warning, sampling: .throttle(5.0))
+                }
                 self.frameCount = 0
             }
         }
@@ -364,49 +537,52 @@ class RemoteViewModel: ObservableObject {
 // MARK: - NetworkReceiverDelegate
 
 extension RemoteViewModel: NetworkReceiverDelegate {
+    
+
+    
     nonisolated func networkReceiver(_ receiver: NetworkReceiver, didReceiveVPS data: Data) {
         Task { @MainActor in
+            Logger.pipeline("★ VPS受信: \(data.count) bytes → HEVCストリーム検出", sampling: .always)
             decoder.setVPS(data)
         }
     }
     
     nonisolated func networkReceiver(_ receiver: NetworkReceiver, didReceiveSPS data: Data) {
         Task { @MainActor in
+            Logger.pipeline("★ SPS受信: \(data.count) bytes", sampling: .always)
             decoder.setSPS(data)
         }
     }
     
     nonisolated func networkReceiver(_ receiver: NetworkReceiver, didReceivePPS data: Data) {
         Task { @MainActor in
+            Logger.pipeline("★ PPS受信: \(data.count) bytes", sampling: .always)
             decoder.setPPS(data)
         }
     }
     
     nonisolated func networkReceiver(_ receiver: NetworkReceiver, didReceiveVideoFrame data: Data, isKeyFrame: Bool, timestamp: UInt64) {
+        // ★ Phase 1: 受信時刻記録（nonisolated安全）
+        let receiveTime = CFAbsoluteTimeGetCurrent()
+        
         Task { @MainActor in
+            // ★ Phase 1: 受信時刻保存
+            self.lastReceiveTimestamp = receiveTime
+            
             // 動画フレームを受信したらPNGデータをクリア（動画モードに復帰）
             if currentPNGData != nil {
                 currentPNGData = nil
             }
+            
+            // ★ Phase 1: デコード開始時刻記録
+            self.lastDecodeStartTimestamp = CFAbsoluteTimeGetCurrent()
+            
             let presentationTime = CMTime(value: CMTimeValue(timestamp), timescale: 1_000_000_000)
             decoder.decode(annexBData: data, presentationTime: presentationTime)
         }
     }
     
-    nonisolated func networkReceiver(_ receiver: NetworkReceiver, didReceivePNG data: Data) {
-        Task { @MainActor in
-            // PNGデータを受信したら更新
-            currentPNGData = data
-            // Coordinator に表示を依頼（デコードはCoordinator内で最適化されている）
-            previewCoordinator.displayPNG(data)
-            
-            // ★ ログは軽量化（メインスレッドでのUIImage生成を廃止）
-            pngReceiveCount += 1
-            if pngReceiveCount == 1 || pngReceiveCount % 100 == 0 {
-                // print("[RemoteViewModel] 🖼️ PNG受信: \(data.count / 1024)KB (累計\(pngReceiveCount)回)")
-            }
-        }
-    }
+
     
     nonisolated func networkReceiver(_ receiver: NetworkReceiver, didChangeState state: NetworkReceiver.ConnectionState) {
         Task { @MainActor in
@@ -445,15 +621,56 @@ extension RemoteViewModel: NetworkReceiverDelegate {
                 isConnected = true  // ★ 重要: 接続状態をtrueに設定
                 isConnecting = false
                 saveCurrentHost()  // ★ 接続成功時にホスト情報を保存
-                // print("[RemoteViewModel] ✅ 認証成功")
+                Logger.pipeline("✅ 認証成功: 接続確立", sampling: .always)
             } else {
                 // 認証拒否
                 authDenied = true
                 isConnected = false
                 isConnecting = false
                 connectionError = "接続が拒否されました"
+                Logger.pipeline("❌ 認証拒否: 切断実行", sampling: .always)
                 disconnect()
-                // print("[RemoteViewModel] ❌ 認証拒否")
+            }
+        }
+    }
+    
+    // ★ Phase 2: 全知全能ステート受信
+    nonisolated func networkReceiver(_ receiver: NetworkReceiver, didReceiveOmniscientState state: OmniscientState) {
+        Task { @MainActor in
+            // ★ Phase 1: iPhone側ローカルメトリクスを注入
+            var enrichedState = state
+            
+            // macOS側からの壁時計を使ってネットワーク遊延を推定
+            // （NTP同期なしの粗推定だが、相対変化は追跡可能）
+            if state.hostWallClockMs > 0 {
+                let localMs = CFAbsoluteTimeGetCurrent() * 1000.0
+                let transitMs = max(0, localMs - state.hostWallClockMs)
+                // RTT/2との整合性チェック: 10秒以上のズレは時計同期エラーとみなしRTT/2を使用
+                if transitMs < 10000 {
+                    emaNetworkTransitMs = emaNetworkTransitMs == 0 ? transitMs
+                        : emaNetworkTransitMs * (1.0 - emaAlpha) + transitMs * emaAlpha
+                } else {
+                    emaNetworkTransitMs = state.rtt * 1000.0 / 2.0
+                }
+            }
+            
+            // ★ Phase 1: iPhone側ローカル計測値を注入
+            enrichedState.networkTransitMs = emaNetworkTransitMs
+            enrichedState.receiveToDecodeMs = emaReceiveToDecodeMs
+            enrichedState.decodeDurationMs = emaDecodeDurationMs
+            enrichedState.renderMs = emaRenderMs
+            
+            // End-to-End合計 = macOS側(Capture+Encode+Packetize) + Network + iPhone側(Receive→Decode+Render)
+            enrichedState.endToEndMs = enrichedState.captureToEncodeMs
+                + enrichedState.encodeDurationMs
+                + enrichedState.packetizeMs
+                + emaNetworkTransitMs
+                + emaReceiveToDecodeMs
+                + emaRenderMs
+            
+            // アニメーション付きで更新（滑らかに）
+            withAnimation(.linear(duration: 0.2)) {
+                self.currentOmniscientState = enrichedState
             }
         }
     }
@@ -463,10 +680,34 @@ extension RemoteViewModel: NetworkReceiverDelegate {
 
 extension RemoteViewModel: VideoDecoderDelegate {
     nonisolated func videoDecoder(_ decoder: VideoDecoder, didOutputPixelBuffer pixelBuffer: CVPixelBuffer, presentationTime: CMTime) {
+        // ★ Phase 1: デコード完了時刻（nonisolated安全）
+        let decodeEndTime = CFAbsoluteTimeGetCurrent()
+        
         Task { @MainActor in
+            // ★ Phase 1: デコード所要時間計算
+            if lastDecodeStartTimestamp > 0 {
+                let decodeDurationMs = (decodeEndTime - lastDecodeStartTimestamp) * 1000.0
+                emaDecodeDurationMs = emaDecodeDurationMs == 0 ? decodeDurationMs
+                    : emaDecodeDurationMs * (1.0 - emaAlpha) + decodeDurationMs * emaAlpha
+            }
+            
+            // ★ Phase 1: 受信→デコード完了の全体時間
+            if lastReceiveTimestamp > 0 {
+                let receiveToDecodeMs = (decodeEndTime - lastReceiveTimestamp) * 1000.0
+                emaReceiveToDecodeMs = emaReceiveToDecodeMs == 0 ? receiveToDecodeMs
+                    : emaReceiveToDecodeMs * (1.0 - emaAlpha) + receiveToDecodeMs * emaAlpha
+            }
+            
             decodedFrameCount += 1
             frameCount += 1
+            
+            // ★ Phase 1: レンダー開始時刻
+            let renderStart = CFAbsoluteTimeGetCurrent()
             previewCoordinator.display(pixelBuffer: pixelBuffer, presentationTime: presentationTime)
+            let renderMs = (CFAbsoluteTimeGetCurrent() - renderStart) * 1000.0
+            emaRenderMs = emaRenderMs == 0 ? renderMs
+                : emaRenderMs * (1.0 - emaAlpha) + renderMs * emaAlpha
+            lastRenderTimestamp = CFAbsoluteTimeGetCurrent()
         }
     }
     
@@ -503,15 +744,23 @@ extension RemoteViewModel: VideoDecoderDelegate {
         }
         
         connectionRetryCount += 1
-        print("[RemoteViewModel] ⚠️ 接続タイムアウト (リトライ: \(connectionRetryCount)/\(maxRetryCount))")
+        Logger.network("⚠️ 接続タイムアウト (リトライ: \(connectionRetryCount)/\(maxRetryCount))")
         
         if connectionRetryCount < maxRetryCount {
             // 自動リトライ
-            print("[RemoteViewModel] 🔄 自動リトライ開始...")
+            Logger.network("🔄 自動リトライ開始...")
             
             // 一旦切断してから再接続
             networkReceiver.disconnect()
             inputSender.disconnect()
+            
+            // ★ スマートリトライロジック
+            // ICE候補が取得できている場合は、P2P/TURN接続への切り替えを試みる
+            if !cachedICECandidates.isEmpty {
+                Logger.network("🚀 CloudKitのICE候補(\(cachedICECandidates.count)件)を使用してNAT越えリトライを実行します")
+                connectWithICE(candidates: cachedICECandidates)
+                return
+            }
             
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                 guard let self = self, let portNumber = UInt16(self.port) else { return }
@@ -531,16 +780,155 @@ extension RemoteViewModel: VideoDecoderDelegate {
             }
         } else {
             // 最大リトライ回数に達した → エラー表示
-            print("[RemoteViewModel] ❌ 接続失敗: 最大リトライ回数超過")
+            Logger.network("❌ 接続失敗: 最大リトライ回数超過")
             
             isConnecting = false
             isWaitingForAuth = false
-            connectionError = "接続タイムアウト: Macに接続できません。\n・同じWi-Fiに接続していますか？\n・Macのファイアウォール設定を確認してください"
+            
+            if !cachedICECandidates.isEmpty {
+                 connectionError = "接続タイムアウト: NAT越え(TURN)も失敗しました。\n・モバイル回線の電波状況を確認してください\n・Mac側でTURNサーバーへの接続が許可されているか確認してください"
+            } else {
+                 connectionError = "接続タイムアウト: Macに接続できません。\n・同じWi-Fiに接続していますか？\n・Macのファイアウォール設定を確認してください"
+            }
             
             // 接続クリーンアップ
             networkReceiver.disconnect()
             inputSender.disconnect()
             connectionRetryCount = 0
+            cachedICECandidates = [] // キャッシュクリア
+        }
+    }
+    
+    /// ICE候補を使って接続（P2Pマネージャーへ委譲）
+    private func connectWithICE(candidates: [ICECandidate]) {
+        // ★ Step 2: 直接接続が既に成功している場合はICE接続を開始しない
+        if isConnected && !isWaitingForAuth {
+            Logger.p2p("ICE接続スキップ: 直接接続が既に成功")
+            return
+        }
+        
+        // ★ B-1: TURN接続進行中フラグを設定
+        isTURNInProgress = true
+        
+        // タイマー停止（P2Pマネージャーが独自にタイムアウト管理するため）
+        cancelConnectionTimeout()
+        
+        Task { @MainActor in
+            let p2pManager = P2PConnectionManager()
+            self.activeP2PManager = p2pManager  // ★ B-1: 保持
+            
+            // 状態監視
+            p2pManager.setConnectionHandler { [weak self] (state: P2PConnectionState) in
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    
+                    // ★ Step 2: 直接接続が既に成功していたらICE結果を無視
+                    if self.isConnected && !self.isWaitingForAuth {
+                        Logger.p2p("ICE結果無視: 直接接続が既に成功")
+                        return
+                    }
+                    
+                    switch state {
+                    case .connected(let endpoint):
+                        Logger.p2p("✅ スマートリトライ成功: \(endpoint)")
+                        
+                        // ★ Step 2: TURN経由の場合はTURNデータパスを使用
+                        if endpoint.hasPrefix("TURN:") {
+                            Logger.network("🔄 TURN relay接続成功 → TURNデータパス構築")
+                            
+                            // NetworkReceiverをTURNモードに切り替え
+                            self.networkReceiver.connectViaTURN()
+                            
+                            // TURNClient.onDataReceived → NetworkReceiver.injectTURNData()
+                            if let turnClient = p2pManager.turnClient {
+                                Task {
+                                    await turnClient.setDataHandler { [weak self] data in
+                                        self?.networkReceiver.injectTURNData(data)
+                                    }
+                                    
+                                    // ★ A-3: TURN経由で登録パケット(0xFE)をMacに送信
+                                    // Mac側のenableTURNReception()がこれを検出してTURNモードに切替
+                                    do {
+                                        var regPacket = Data()
+                                        regPacket.append(0xFE)  // 登録パケットタイプ
+                                        // ポート番号（2バイト）
+                                        let listenPort: UInt16 = 5001
+                                        regPacket.append(UInt8(listenPort >> 8))
+                                        regPacket.append(UInt8(listenPort & 0xFF))
+                                        
+                                        // ★ A-2修正: iPhoneのrelayアドレスを含める（Mac→iPhone送信用）
+                                        // relayIP（NULL終端文字列）
+                                        let myRelayIP = p2pManager.myRelayIP
+                                        let myRelayPort = p2pManager.myRelayPort
+                                        if let ipData = myRelayIP.data(using: .utf8) {
+                                            regPacket.append(ipData)
+                                        }
+                                        regPacket.append(0x00) // NULL終端
+                                        // relayPort（2バイト BigEndian）
+                                        regPacket.append(UInt8(myRelayPort >> 8))
+                                        regPacket.append(UInt8(myRelayPort & 0xFF))
+                                        
+                                        // userRecordID
+                                        if let userID = self.networkReceiver.cachedUserRecordID,
+                                           let idData = userID.data(using: .utf8) {
+                                            regPacket.append(idData)
+                                        }
+                                        
+                                        // endpointからMacのrelay addressを抽出
+                                        let turnParts = endpoint.replacingOccurrences(of: "TURN:", with: "").split(separator: ":")
+                                        if turnParts.count >= 2,
+                                           let peerPort = UInt16(turnParts.last!) {
+                                            let peerIP = String(turnParts.dropLast().joined(separator: ":"))
+                                            try await turnClient.sendData(regPacket, to: peerIP, peerPort: peerPort)
+                                            Logger.network("✅ TURN経由で登録パケット送信完了 → \(peerIP):\(peerPort) (myRelay=\(myRelayIP):\(myRelayPort))")
+                                        }
+                                    } catch {
+                                        Logger.network("⚠️ TURN登録パケット送信失敗: \(error)", level: .warning)
+                                    }
+                                }
+                            }
+                            
+                            // 成功扱い
+                            self.isConnected = true
+                            self.isWaitingForAuth = false
+                            self.isConnecting = false
+                            self.markConnectionSuccessful()
+                        } else {
+                            // ★ host/STUN候補での接続成功 → 従来の直接接続
+                            let parts = endpoint.split(separator: ":")
+                            if parts.count >= 2 {
+                                let host = String(parts[parts.count-2])
+                                let port = String(parts[parts.count-1])
+                                
+                                self.hostAddress = host
+                                self.port = port
+                                
+                                if let portNum = UInt16(port) {
+                                    self.networkReceiver.connect(to: host, port: portNum)
+                                    self.inputSender.connect(to: host)
+                                    self.markConnectionSuccessful()
+                                }
+                            }
+                        }
+                        
+                    case .failed(let reason):
+                        Logger.p2p("スマートリトライ失敗: \(reason)", level: .warning)
+                        Task { @MainActor in
+                            // ★ B-1: TURN含む全候補失敗時のみここに到達
+                            self.isTURNInProgress = false
+                            self.connectionError = "NAT越え接続失敗: \(reason)"
+                            self.isConnecting = false
+                            self.isWaitingForAuth = false
+                            self.disconnect()
+                        }
+                    default:
+                        break
+                    }
+                }
+            }
+            
+            // 接続開始
+            p2pManager.connectWithICE(candidates: candidates)
         }
     }
     
@@ -549,5 +937,54 @@ extension RemoteViewModel: VideoDecoderDelegate {
         cancelConnectionTimeout()
         connectionRetryCount = 0
         print("[RemoteViewModel] ✅ 接続成功確認 - タイムアウトキャンセル")
+    }
+}
+
+// MARK: - DeviceSensorDelegate
+
+extension RemoteViewModel: DeviceSensorDelegate {
+    nonisolated func deviceSensor(_ sensor: DeviceSensor, didUpdateMetrics metrics: ClientDeviceMetrics) {
+        Task { @MainActor in
+            // InputSender経由でHostへ送信
+            guard isConnected else { return }
+            inputSender.sendTelemetry(metrics: metrics, fps: frameRate)
+        }
+    }
+}
+
+// MARK: - InputSenderDelegate
+
+extension RemoteViewModel: InputSenderDelegate {
+    nonisolated func inputSender(_ sender: InputSender, didChangeState connected: Bool) {
+        Task { @MainActor in
+            Logger.network("📡 InputSender状態変化: \(connected ? "接続済み" : "切断")")
+        }
+    }
+    
+    nonisolated func inputSender(_ sender: InputSender, didFailWithError error: Error) {
+        Task { @MainActor in
+            Logger.network("❌ InputSenderエラー: \(error.localizedDescription)", level: .error)
+        }
+    }
+    
+    nonisolated func inputSender(_ sender: InputSender, didReceiveAuthResult approved: Bool) {
+        Task { @MainActor in
+            Logger.network("🔑 UDP認証結果受信: \(approved ? "許可✅" : "拒否❌")")
+            if approved {
+                // ★ タイムアウトキャンセル＆接続成功マーク
+                self.markConnectionSuccessful()
+                
+                // 接続状態を更新（まだ未接続なら）
+                if !self.isConnected {
+                    self.isConnected = true
+                    self.isConnecting = false
+                    self.connectionError = nil
+                    Logger.network("✅ UDP認証経由で接続確立")
+                }
+            } else {
+                self.connectionError = "接続が拒否されました"
+                self.isConnecting = false
+            }
+        }
     }
 }

@@ -41,7 +41,7 @@ class FECDecoder {
         
         // 元データサイズを読み取り
         let originalSize = data.subdata(in: 0..<4).withUnsafeBytes {
-            UInt32(bigEndian: $0.load(as: UInt32.self))
+            UInt32(bigEndian: $0.loadUnaligned(fromByteOffset: 0, as: UInt32.self))
         }
         
         // サイズ検証
@@ -61,8 +61,8 @@ class FECDecoder {
         if verified {
             return .success(originalData)
         } else {
-            // パリティ不一致でも、データ自体は返す（軽微な破損の可能性）
-            return .success(originalData)
+            // パリティ不一致 — データ破損の可能性を報告
+            return .partialRecovery(originalData, missingBlocks: [])
         }
     }
     

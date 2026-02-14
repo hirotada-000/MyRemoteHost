@@ -18,11 +18,7 @@ class SampleBufferDisplayView: UIView {
     
     private var displayLayer: AVSampleBufferDisplayLayer!
     
-    /// ★ 静止画表示用 ImageView（最高画質JPEG用）
-    private var imageView: UIImageView!
-    
-    /// ★ PNG表示中フラグ（動画フレームによる上書きを防止）
-    private(set) var isPNGDisplaying: Bool = false
+
     
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -41,40 +37,18 @@ class SampleBufferDisplayView: UIView {
         displayLayer.backgroundColor = UIColor.black.cgColor
         layer.addSublayer(displayLayer)
         
-        // ★ 静止画 ImageView（動画レイヤーの上に配置）
-        imageView = UIImageView(frame: bounds)
-        imageView.contentMode = .scaleAspectFit
-        imageView.backgroundColor = .clear
-        imageView.isHidden = true // デフォルトは動画モード
-        
-        // ★ Pixel Perfect Rendering: データを壊さずに綺麗に縮小する設定
-        // minificationFilter: .trilinear (ミップマップを使用した高品質縮小)
-        imageView.layer.minificationFilter = .trilinear
-        // magnificationFilter: .trilinear (拡大時も滑らかに)
-        imageView.layer.magnificationFilter = .trilinear
-        // contentsScale: Retinaディスプレイのピクセル密度に合わせる
-        imageView.layer.contentsScale = UIScreen.main.scale
-        
-        addSubview(imageView)
+
     }
     
     override func layoutSubviews() {
         super.layoutSubviews()
         displayLayer.frame = bounds
-        imageView.frame = bounds
+        displayLayer.frame = bounds
     }
     
     /// CMSampleBuffer を表示キューに追加
     func enqueue(_ sampleBuffer: CMSampleBuffer) {
-        // ★ PNG表示中は動画フレームをスキップ（PNGが上書きされるのを防止）
-        if isPNGDisplaying {
-            return
-        }
-        // ★ 動画表示時は ImageView を隠す
-        if !imageView.isHidden {
-            imageView.isHidden = true
-            imageView.image = nil
-        }
+
         
         if displayLayer.status == .failed {
             displayLayer.flush()
@@ -83,33 +57,11 @@ class SampleBufferDisplayView: UIView {
         displayLayer.enqueue(sampleBuffer)
     }
     
-    /// ★ PNG/静止画データを表示（またはクリア）
-    func displayPNG(data: Data?) {
-        if let data = data, let image = UIImage(data: data) {
-            displayImage(image)
-            isPNGDisplaying = true  // ★ PNG表示中フラグを立てる
-        } else {
-            // 動画モード復帰
-            isPNGDisplaying = false  // ★ フラグを解除
-            imageView.isHidden = true
-            imageView.image = nil
-        }
-    }
-    
-    /// ★ UIImage を直接表示
-    func displayImage(_ image: UIImage) {
-        imageView.image = image
-        imageView.isHidden = false
-        isPNGDisplaying = true  // ★ PNG表示中フラグを立てる
-        // 動画レイヤーをクリア（任意）
-        // displayLayer.flushAndRemoveImage()
-    }
+
     
     /// 表示をクリア
     func flush() {
         displayLayer.flushAndRemoveImage()
-        imageView.image = nil
-        imageView.isHidden = true
     }
     
     /// CVPixelBuffer から CMSampleBuffer を作成して表示
@@ -154,8 +106,6 @@ struct PreviewView: UIViewRepresentable {
     typealias UIViewType = SampleBufferDisplayView
     
     @Binding var currentSampleBuffer: CMSampleBuffer?
-    /// ★ PNG データ（静止画モード用）
-    @Binding var currentPNGData: Data?
     
     func makeUIView(context: Context) -> SampleBufferDisplayView {
         let view = SampleBufferDisplayView()
@@ -163,8 +113,6 @@ struct PreviewView: UIViewRepresentable {
     }
     
     func updateUIView(_ uiView: SampleBufferDisplayView, context: Context) {
-        // ★ PNG データの更新チェック
-        uiView.displayPNG(data: currentPNGData)
         
         if let buffer = currentSampleBuffer {
             uiView.enqueue(buffer)
@@ -178,18 +126,14 @@ struct PreviewView: UIViewRepresentable {
 class PreviewViewCoordinator: ObservableObject {
     private(set) var displayView: SampleBufferDisplayView?
     
-    /// ★ MetalPreviewUIViewへの参照（PNG/動画モード切替用）
-    private weak var metalPreviewView: MetalPreviewUIView?
+    /// Metal Rendering を使用するかどうか
+    @Published var useMetalRendering: Bool = true
     
-    /// ★ Metal Direct Rendering 対応
+    /// Metal Renderer
     private var metalRenderer: ProMotionSyncRenderer?
-    private weak var metalLayer: CAMetalLayer?
+    private var metalLayer: CAMetalLayer?
     
-    /// Metal Rendering を使用するかどうか（デフォルト: true）
-    var useMetalRendering: Bool = true
-    
-    /// PNG表示カウンター（ログ頻度制御用）
-    private var pngDisplayCount = 0
+
     
     /// 現在のFPS（Metal Rendering時のみ有効）
     var currentFPS: Double {
@@ -200,10 +144,7 @@ class PreviewViewCoordinator: ObservableObject {
         self.displayView = view
     }
     
-    /// ★ MetalPreviewUIViewを設定
-    func setMetalPreviewView(_ view: MetalPreviewUIView) {
-        self.metalPreviewView = view
-    }
+
     
     /// ★ Metal Layer を設定して ProMotion 同期開始
     func setupMetalRendering(metalLayer: CAMetalLayer) {
@@ -249,46 +190,7 @@ class PreviewViewCoordinator: ObservableObject {
         metalRenderer?.updateDrawableSize(size)
     }
     
-    /// ★ PNG データを表示
-    func displayPNG(_ data: Data?) {
-        guard let data = data else {
-            // ★ 動画モード復帰 (メインスレッドで実行)
-            DispatchQueue.main.async {
-                self.metalPreviewView?.showVideoMode()
-                self.displayView?.displayPNG(data: nil)
-            }
-            return
-        }
-        
-        // ★ PNGモード表示切り替え (メインスレッドで即座に実行)
-        DispatchQueue.main.async {
-            self.metalPreviewView?.showPNGMode()
-        }
-        
-        // ★ バックグラウンドでUIImage生成（メインスレッドブロック回避）
-        DispatchQueue.global(qos: .userInitiated).async {
-            guard let image = UIImage(data: data) else {
-                print("[PreviewCoordinator] ⚠️ Failed to create image from data")
-                DispatchQueue.main.async {
-                    self.displayView?.displayPNG(data: nil)
-                }
-                return
-            }
-            
-            // ★ メインスレッドで表示のみ実行
-            DispatchQueue.main.async {
-                // 解像度検証ログ（100回ごと）
-                self.pngDisplayCount += 1
-                if self.pngDisplayCount == 1 || self.pngDisplayCount % 100 == 0 {
-                    let pixelW = image.size.width * image.scale
-                    let pixelH = image.size.height * image.scale
-                    print("[PreviewCoordinator] 🖼️ PNG表示: \(Int(pixelW))x\(Int(pixelH))px (累計\(self.pngDisplayCount)回)")
-                }
-                
-                self.displayView?.displayImage(image)
-            }
-        }
-    }
+
 }
 
 /// Coordinator を使用するプレビュービュー
@@ -308,7 +210,6 @@ struct CoordinatedPreviewView: UIViewRepresentable {
         // フォールバック用の SampleBufferDisplayView も設定
         DispatchQueue.main.async {
             coordinator.setDisplayView(view.sampleBufferView)
-            coordinator.setMetalPreviewView(view)  // ★ PNG/動画モード切替用
         }
         
         // レイアウト変更検知
@@ -362,24 +263,18 @@ class MetalPreviewUIView: UIView {
             self.metalLayer = metal
         }
         
-        // SampleBuffer Display View（PNG表示用）
+        // SampleBuffer Display View（フォールバック用）
         sampleBufferView = SampleBufferDisplayView(frame: bounds)
-        sampleBufferView.isHidden = true  // ★ 初期状態は非表示（動画モード）
+        // sampleBufferView.isHidden = true  // ← これが不要になるが、Metal優先なら隠すべき？
+        // いや、MetalLayerの下にあれば問題ないが、MetalLayerがframebufferOnlyで透過しないなら隠れていたほうが描画負荷的に良いかも。
+        // 元々 showVideoMode で isHidden=true にしていた。
+        // MetalLayerがある場合は sampleBufferView は隠すべき。
+        // ここでは一旦そのままにし、Coordinatorで制御するか、あるいはMetalLayerが前面にあれば見えない。
+        sampleBufferView.isHidden = true 
         addSubview(sampleBufferView)
     }
     
-    /// ★ PNGモード: Metal Layerを非表示にしてPNG表示を有効化
-    func showPNGMode() {
-        metalLayer?.isHidden = true
-        sampleBufferView.isHidden = false
-        sampleBufferView.backgroundColor = .black
-    }
-    
-    /// ★ 動画モード: Metal Layerを表示してsampleBufferViewを非表示
-    func showVideoMode() {
-        metalLayer?.isHidden = false
-        sampleBufferView.isHidden = true
-    }
+
     
     override func layoutSubviews() {
         super.layoutSubviews()

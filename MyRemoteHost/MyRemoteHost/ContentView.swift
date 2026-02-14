@@ -252,30 +252,7 @@ struct ContentView: View {
                 
                 Spacer()
                 
-                // ★ ハイブリッドモード
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack {
-                        Text("ハイブリッド")
-                            .font(.caption)
-                        Text("(\(viewModel.currentMode))")
-                            .font(.caption2)
-                            .foregroundColor(viewModel.currentMode == "PNG" ? .green : .blue)
-                    }
-                    Toggle("", isOn: $viewModel.hybridMode)
-                        .toggleStyle(.switch)
-                }
-                
-                /*
-                // JPEG 品質 (削除: PNGはLosslessなので設定不要)
-                if viewModel.hybridMode {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("JPEG品質: \(Int(viewModel.jpegQuality * 100))%")
-                            .font(.caption)
-                        Slider(value: $viewModel.jpegQuality, in: 0.7...1.0, step: 0.05)
-                            .frame(width: 80)
-                    }
-                }
-                */
+                // ★ 動画一本化: ハイブリッドモードUI廃止
             }
         }
         .padding(.vertical, 4)
@@ -347,7 +324,7 @@ struct ContentView: View {
                         Text("\(viewModel.connectedClients)クライアント接続中")
                             .font(.caption)
                     } else {
-                        Text("ポート5000で待機中")
+                        Text("ポート\(NetworkTransportConfiguration.default.videoPort)で待機中")
                             .font(.caption)
                     }
                 } else {
@@ -464,7 +441,8 @@ struct ContentView: View {
                 .font(.title2)
                 .fontWeight(.bold)
             
-            if let connectionString = QRCodeGenerator.generateConnectionString(port: 5100),
+            // ★ ハードコード排除: 設定値を参照してポート統一
+            if let connectionString = QRCodeGenerator.generateConnectionString(port: NetworkTransportConfiguration.default.videoPort),
                let qrImage = QRCodeGenerator.generateQRCode(from: connectionString, size: CGSize(width: 250, height: 250)) {
                 
                 Image(nsImage: qrImage)

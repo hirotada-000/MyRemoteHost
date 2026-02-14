@@ -44,75 +44,93 @@ class VideoDecoder {
     private let startCode: [UInt8] = [0x00, 0x00, 0x00, 0x01]
     private let shortStartCode: [UInt8] = [0x00, 0x00, 0x01]
     
-    // MARK: - ログ頻度制御
-    
-    /// パラメータセットログ済みフラグ
-    private var hasLoggedParameterSets = false
+    // MARK: - ログ・カウンタ
     
     /// デコードエラーカウンター
     private var decodeErrorCount = 0
     
-    /// 最後のデコードエラーログ時刻
-    private var lastDecodeErrorLogTime: Date?
+    /// キーフレーム待機中のPフレームスキップカウンタ
+    private var decodeSkipCount = 0
     
     // MARK: - Public Methods
     
     /// VPS を設定（HEVCのみ）
     func setVPS(_ data: Data) {
         let newVPS = removeStartCode(from: data)
+        guard !newVPS.isEmpty else { return }  // ★ 空データガード
+        
+        // ★ コーデック切替検出: VPS受信 = HEVCストリーム
+        if !isHEVC {
+            Logger.video("★★★ コーデック切替検出: H.264 → HEVC (VPS受信)", sampling: .always)
+            // ★ switchCodecではパラメータをクリアしない（VPSはこの後設定するため）
+            destroySession()
+            isHEVC = true
+            spsData = nil  // SPS/PPSは古いのでクリア
+            ppsData = nil
+            decodeErrorCount = 0
+            decodeSkipCount = 0
+        }
         
         // ★ パラメータが変更された場合はセッションを破棄して再作成
         if vpsData != nil && vpsData != newVPS {
-            // print("[VideoDecoder] ★ VPS変更検出 - セッション再作成")
+            Logger.video("★ VPS変更検出 - セッション再作成", sampling: .always)
             destroySession()
         }
         
         vpsData = newVPS
         isHEVC = true  // VPSが送られてきたらHEVC
-        if !hasLoggedParameterSets {
-            // print("[VideoDecoder] HEVC VPS設定: \(vpsData?.count ?? 0)バイト")
-        }
+        Logger.video("HEVC VPS設定: \(newVPS.count)バイト", sampling: .oncePerSession)
         tryCreateSession()
     }
     
     /// SPS を設定
     func setSPS(_ data: Data) {
         let newSPS = removeStartCode(from: data)
+        guard !newSPS.isEmpty else { return }  // ★ 空データガード
+        
+        // ★ NALヘッダーからコーデックを自動判定
+        let detectedHEVC = detectCodecFromSPS(newSPS)
+        if detectedHEVC != isHEVC {
+            Logger.video("★★★ コーデック切替検出: \(isHEVC ? "HEVC" : "H.264") → \(detectedHEVC ? "HEVC" : "H.264") (SPS NAL解析)", sampling: .always)
+            destroySession()
+            isHEVC = detectedHEVC
+            vpsData = nil  // 古いパラメータをクリア
+            ppsData = nil
+            decodeErrorCount = 0
+            decodeSkipCount = 0
+        }
         
         // ★ パラメータが変更された場合はセッションを破棄して再作成
         if spsData != nil && spsData != newSPS {
-            // print("[VideoDecoder] ★ SPS変更検出 - セッション再作成")
+            Logger.video("★ SPS変更検出 - セッション再作成", sampling: .always)
             destroySession()
         }
         
         spsData = newSPS
-        if !hasLoggedParameterSets {
-            // print("[VideoDecoder] SPS設定: \(spsData?.count ?? 0)バイト")
-        }
+        Logger.video("SPS設定: \(newSPS.count)バイト (コーデック: \(isHEVC ? "HEVC" : "H.264"))", sampling: .oncePerSession)
         tryCreateSession()
     }
     
     /// PPS を設定
     func setPPS(_ data: Data) {
         let newPPS = removeStartCode(from: data)
+        guard !newPPS.isEmpty else { return }  // ★ 空データガード
         
         // ★ パラメータが変更された場合はセッションを破棄して再作成
         if ppsData != nil && ppsData != newPPS {
-            // print("[VideoDecoder] ★ PPS変更検出 - セッション再作成")
+            Logger.video("★ PPS変更検出 - セッション再作成", sampling: .always)
             destroySession()
         }
         
         ppsData = newPPS
-        if !hasLoggedParameterSets {
-            // print("[VideoDecoder] PPS設定: \(ppsData?.count ?? 0)バイト")
-            hasLoggedParameterSets = true
-        }
+        Logger.video("PPS設定: \(newPPS.count)バイト", sampling: .oncePerSession)
         tryCreateSession()
     }
     
     /// Annex B 形式のデータをデコード
     func decode(annexBData: Data, presentationTime: CMTime) {
         guard isSessionReady, decompressionSession != nil else {
+            Logger.video("⚠️ デコードスキップ: セッション未準備 (ready=\(isSessionReady), session=\(decompressionSession != nil), HEVC=\(isHEVC), VPS=\(vpsData?.count ?? 0), SPS=\(spsData?.count ?? 0), PPS=\(ppsData?.count ?? 0))", sampling: .throttle(3.0))
             return
         }
         
@@ -138,35 +156,161 @@ class VideoDecoder {
             VTDecompressionSessionWaitForAsynchronousFrames(session)
             VTDecompressionSessionInvalidate(session)
             decompressionSession = nil
-            // print("[VideoDecoder] セッション破棄")
+            Logger.video("★ デコードセッション破棄", sampling: .always)
         }
         formatDescription = nil
         isSessionReady = false
         waitingForKeyFrame = true  // ★ セッション破棄時はキーフレーム待機に戻る
     }
     
+    /// ★ コーデック切替時のフルリセット（Apple VideoToolbox公式ベストプラクティス）
+    /// H.264↔HEVCの切替はセッション再作成が必須
+    private func switchCodec(toHEVC: Bool) {
+        Logger.video("★★★ コーデック切替実行: \(isHEVC ? "HEVC" : "H.264") → \(toHEVC ? "HEVC" : "H.264")", sampling: .always)
+        destroySession()
+        vpsData = nil
+        spsData = nil
+        ppsData = nil
+        isHEVC = toHEVC
+        decodeErrorCount = 0
+        decodeSkipCount = 0
+        Logger.video("★★★ コーデック切替完了: 新モード=\(toHEVC ? "HEVC" : "H.264") — パラメータセット待機中", sampling: .always)
+    }
+    
+    /// ★ SPS NALヘッダーからコーデックを判定
+    /// - H.264 SPS: NAL type = 7 (forbidden_bit=0, nal_ref_idc=3, nal_unit_type=7 → 0x67 or 0x27)
+    /// - HEVC SPS: NAL type = 33 (forbidden_bit=0, nal_unit_type=33 → first byte: (33 << 1) = 0x42)
+    private func detectCodecFromSPS(_ sps: Data) -> Bool {
+        guard let firstByte = sps.first else { return isHEVC }
+        
+        // H.264 NAL header: 1 byte → nal_unit_type = firstByte & 0x1F
+        let h264NalType = firstByte & 0x1F
+        if h264NalType == 7 {
+            // H.264 SPS確定
+            return false
+        }
+        
+        // HEVC NAL header: 2 bytes → nal_unit_type = (firstByte >> 1) & 0x3F
+        let hevcNalType = (firstByte >> 1) & 0x3F
+        if hevcNalType == 33 {
+            // HEVC SPS確定
+            return true
+        }
+        
+        // 判定不能の場合は現在のモードを維持
+        Logger.video("⚠️ SPS NALヘッダー判定不能: 0x\(String(format: "%02X", firstByte)) - 現在モード維持(\(isHEVC ? "HEVC" : "H.264"))", level: .warning, sampling: .always)
+        return isHEVC
+    }
+    
     // MARK: - Private Methods
     
     private func tryCreateSession() {
         guard let sps = spsData, let pps = ppsData else { return }
-        guard decompressionSession == nil else { return }
         
         // HEVC の場合は VPS も必要
         if isHEVC && vpsData == nil {
-            // print("[VideoDecoder] HEVC: VPS待機中...")
+            Logger.video("HEVC: VPS待機中...", sampling: .throttle(3.0))
             return
         }
         
+        // ★ 既存セッションがある場合: 新しいフォーマットを受け入れられるかチェック
+        if let existingSession = decompressionSession {
+            // 新しいFormatDescriptionを作成して互換性を確認
+            if let newFormat = createFormatDescription(sps: sps, pps: pps) {
+                if VTDecompressionSessionCanAcceptFormatDescription(existingSession, formatDescription: newFormat) {
+                    // 互換性あり: セッション再作成不要
+                    formatDescription = newFormat
+                    Logger.video("★ FormatDescription更新(セッション互換)", sampling: .always)
+                    return
+                } else {
+                    // 非互換: セッション再作成が必要
+                    Logger.video("★ FormatDescription非互換 → セッション再作成", sampling: .always)
+                    destroySession()
+                }
+            }
+        }
+        
+        guard decompressionSession == nil else { return }
+        
         do {
             if isHEVC {
+                Logger.video("★ HEVC デコードセッション作成開始 (VPS=\(vpsData!.count), SPS=\(sps.count), PPS=\(pps.count))", sampling: .always)
                 try createHEVCDecompressionSession(vps: vpsData!, sps: sps, pps: pps)
             } else {
+                Logger.video("★ H.264 デコードセッション作成開始 (SPS=\(sps.count), PPS=\(pps.count))", sampling: .always)
                 try createH264DecompressionSession(sps: sps, pps: pps)
             }
             isSessionReady = true
+            Logger.video("✅ デコードセッション作成成功 (\(isHEVC ? "HEVC" : "H.264"))", sampling: .always)
         } catch {
-            // print("[VideoDecoder] セッション作成失敗: \(error)")
+            Logger.video("❌ セッション作成失敗: \(error)", level: .error, sampling: .always)
             delegate?.videoDecoder(self, didFailWithError: error)
+        }
+    }
+    
+    /// ★ FormatDescriptionを作成（互換性チェック用）
+    private func createFormatDescription(sps: Data, pps: Data) -> CMVideoFormatDescription? {
+        if isHEVC, let vps = vpsData {
+            var description: CMFormatDescription?
+            let status = vps.withUnsafeBytes { vpsBuffer -> OSStatus in
+                sps.withUnsafeBytes { spsBuffer -> OSStatus in
+                    pps.withUnsafeBytes { ppsBuffer -> OSStatus in
+                        guard let vpsBase = vpsBuffer.baseAddress,
+                              let spsBase = spsBuffer.baseAddress,
+                              let ppsBase = ppsBuffer.baseAddress else {
+                            return kCMFormatDescriptionError_InvalidParameter
+                        }
+                        let pointers: [UnsafePointer<UInt8>] = [
+                            vpsBase.assumingMemoryBound(to: UInt8.self),
+                            spsBase.assumingMemoryBound(to: UInt8.self),
+                            ppsBase.assumingMemoryBound(to: UInt8.self)
+                        ]
+                        let sizes: [Int] = [vps.count, sps.count, pps.count]
+                        return pointers.withUnsafeBufferPointer { pBuf in
+                            sizes.withUnsafeBufferPointer { sBuf in
+                                CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                                    allocator: kCFAllocatorDefault,
+                                    parameterSetCount: 3,
+                                    parameterSetPointers: pBuf.baseAddress!,
+                                    parameterSetSizes: sBuf.baseAddress!,
+                                    nalUnitHeaderLength: 4,
+                                    extensions: nil,
+                                    formatDescriptionOut: &description
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            return status == noErr ? description : nil
+        } else {
+            var description: CMFormatDescription?
+            let status = sps.withUnsafeBytes { spsBuffer -> OSStatus in
+                pps.withUnsafeBytes { ppsBuffer -> OSStatus in
+                    guard let spsBase = spsBuffer.baseAddress,
+                          let ppsBase = ppsBuffer.baseAddress else {
+                        return kCMFormatDescriptionError_InvalidParameter
+                    }
+                    let pointers: [UnsafePointer<UInt8>] = [
+                        spsBase.assumingMemoryBound(to: UInt8.self),
+                        ppsBase.assumingMemoryBound(to: UInt8.self)
+                    ]
+                    let sizes: [Int] = [sps.count, pps.count]
+                    return pointers.withUnsafeBufferPointer { pBuf in
+                        sizes.withUnsafeBufferPointer { sBuf in
+                            CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                                allocator: kCFAllocatorDefault,
+                                parameterSetCount: 2,
+                                parameterSetPointers: pBuf.baseAddress!,
+                                parameterSetSizes: sBuf.baseAddress!,
+                                nalUnitHeaderLength: 4,
+                                formatDescriptionOut: &description
+                            )
+                        }
+                    }
+                }
+            }
+            return status == noErr ? description : nil
         }
     }
     
@@ -292,8 +436,12 @@ class VideoDecoder {
         
         decompressionSession = decompSession
         
+        // ★ 最適化 3-B: RealTimeモード有効化
+        // VideoToolboxにリアルタイムストリーミング用途を通知 → 内部スケジューリング最適化
+        VTSessionSetProperty(decompSession, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+        
         let dimensions = CMVideoFormatDescriptionGetDimensions(formatDesc)
-        // print("[VideoDecoder] \(codecName) セッション作成完了: \(dimensions.width)x\(dimensions.height)")
+        Logger.video("✅ デコードセッション作成成功 (\(codecName)) \(dimensions.width)x\(dimensions.height) [RealTime=ON]", sampling: .always)
     }
     
     private func removeStartCode(from data: Data) -> Data {
@@ -376,7 +524,7 @@ class VideoDecoder {
                 isKeyFrame = true
                 if waitingForKeyFrame {
                     waitingForKeyFrame = false
-                    // print("[VideoDecoder] ★ HEVC キーフレーム受信 - デコード開始")
+                    Logger.video("★ HEVC キーフレーム受信 (NAL=\(nalType)) - デコード開始", sampling: .always)
                 }
             }
         } else {
@@ -393,13 +541,18 @@ class VideoDecoder {
                 isKeyFrame = true
                 if waitingForKeyFrame {
                     waitingForKeyFrame = false
-                    // print("[VideoDecoder] ★ H.264 キーフレーム受信 - デコード開始")
+                    Logger.video("★ H.264 キーフレーム受信 (NAL=5) - デコード開始", sampling: .always)
                 }
             }
         }
         
         // ★ キーフレーム待機中は P フレームをスキップ
         if waitingForKeyFrame && !isKeyFrame {
+            decodeSkipCount += 1
+            if decodeSkipCount == 1 || decodeSkipCount % 100 == 0 {
+                let nalType = isHEVC ? Int((firstByte >> 1) & 0x3F) : Int(firstByte & 0x1F)
+                Logger.video("⏳ キーフレーム待機中 - Pフレームスキップ (NAL=\(nalType), skip#\(decodeSkipCount))", sampling: .throttle(3.0))
+            }
             return
         }
         
@@ -472,23 +625,29 @@ class VideoDecoder {
         
         if decodeStatus != noErr {
             decodeErrorCount += 1
-            let now = Date()
-            if lastDecodeErrorLogTime == nil || now.timeIntervalSince(lastDecodeErrorLogTime!) > 5.0 {
-                // print("[VideoDecoder] デコードエラー: \(decodeStatus) (累計\(decodeErrorCount)回)")
-                lastDecodeErrorLogTime = now
-            }
+            Logger.video("❌ デコードエラー: \(decodeStatus) (累計\(decodeErrorCount)回, HEVC=\(isHEVC))", level: .error, sampling: .throttle(3.0))
         }
     }
+    
+    /// デコード成功カウンタ
+    private var decodedFrameCount: Int = 0
     
     private func handleDecodedFrame(status: OSStatus, imageBuffer: CVImageBuffer?, presentationTime: CMTime) {
         guard status == noErr else {
             if status != -12909 {
-                // print("[VideoDecoder] デコードコールバックエラー: \(status)")
+                Logger.video("❌ デコードコールバックエラー: \(status)", level: .error, sampling: .throttle(3.0))
             }
             return
         }
         
         guard let pixelBuffer = imageBuffer else { return }
+        
+        decodedFrameCount += 1
+        if decodedFrameCount == 1 {
+            let w = CVPixelBufferGetWidth(pixelBuffer)
+            let h = CVPixelBufferGetHeight(pixelBuffer)
+            Logger.video("✅ 初回デコード成功! \(w)x\(h) (\(isHEVC ? "HEVC" : "H.264"))", sampling: .always)
+        }
         
         delegate?.videoDecoder(self, didOutputPixelBuffer: pixelBuffer, presentationTime: presentationTime)
     }

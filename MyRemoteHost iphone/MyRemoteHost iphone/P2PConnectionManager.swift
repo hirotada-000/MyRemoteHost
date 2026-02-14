@@ -44,8 +44,15 @@ public class P2PConnectionManager {
     /// ホールパンチング間隔（ミリ秒）
     private let holePunchInterval: UInt64 = 200
     
-    /// 接続タイムアウト（秒）
-    private let connectionTimeout: TimeInterval = 10.0
+    /// 接続タイムアウト（秒）— host/srflx候補用
+    /// ★ B-1: TURN relay独立タイムアウトのため短め設定
+    private let connectionTimeout: TimeInterval = 1.5
+    
+    /// ★ B-1: TURN relay専用タイムアウト（秒）
+    private let turnRelayTimeout: TimeInterval = 10.0
+    
+    /// ★ B-1: ICE進行中フラグ（外部から確認可能）
+    private(set) var isICEInProgress: Bool = false
     
     /// ホールパンチメッセージ
     private let holePunchMessage = "PUNCH".data(using: .utf8)!
@@ -55,6 +62,13 @@ public class P2PConnectionManager {
     
     /// 同期用キュー
     private let queue = DispatchQueue(label: "P2PConnectionManager")
+    
+    /// ★ Phase 1: TURNクライアント（Step 2: データパス統合のためpublic read可能に）
+    private(set) var turnClient: TURNClient?
+    
+    /// ★ A-2修正: iPhone自身のrelayアドレス（Mac側への登録パケットに含める）
+    private(set) var myRelayIP: String = ""
+    private(set) var myRelayPort: UInt16 = 0
     
     // MARK: - Callbacks
     
@@ -89,32 +103,65 @@ public class P2PConnectionManager {
         }
     }
     
-    /// ICE候補を使用したP2P接続（強化版）
+    /// ICE候補を使用したP2P接続（★ B-1: 再設計版）
+    /// host/srflxを順次試行 → 全失敗時にrelay(TURN)をフォールバック
     public func connectWithICE(candidates: [ICECandidate]) {
         state = .discovering
+        isICEInProgress = true
         notifyStateChange()
         
         guard !candidates.isEmpty else {
             Logger.p2p("❌ ICE候補がありません", level: .error)
+            isICEInProgress = false
             state = .failed(reason: "ICE候補がありません")
             notifyStateChange()
             return
         }
         
-        // 優先度順にソート
+        // ★ B-1: host/srflxとrelayを分離
         let sortedCandidates = candidates.sorted { $0.priority > $1.priority }
-        Logger.p2p("📋 ICE候補試行開始: \(sortedCandidates.count)件")
+        let directCandidates = sortedCandidates.filter { $0.type != .relay }
+        let relayCandidates = sortedCandidates.filter { $0.type == .relay }
         
-        // 順次試行
-        tryNextCandidate(sortedCandidates, index: 0)
+        Logger.p2p("📋 ICE候補試行開始: direct=\(directCandidates.count)件, relay=\(relayCandidates.count)件")
+        
+        // ★ B-1: まずhost/srflxを順次試行
+        tryDirectCandidates(directCandidates, index: 0) { [weak self] success in
+            guard let self = self else { return }
+            if success { return }
+            
+            // ★ B-1: 全direct失敗 → relay(TURN)フォールバック
+            if let relay = relayCandidates.first {
+                Logger.p2p("🔄 direct候補全失敗 → TURN relayフォールバック: \(relay.ip):\(relay.port)")
+                self.attemptTURNRelay(
+                    relayIP: relay.ip,
+                    relayPort: UInt16(relay.port)
+                ) { [weak self] success in
+                    guard let self = self else { return }
+                    self.isICEInProgress = false
+                    if !success {
+                        // ★ B-1: TURN含む全候補失敗 → ここで初めて.failedをnotify
+                        Logger.p2p("❌ すべてのICE候補で失敗（relay含む）", level: .error)
+                        self.state = .failed(reason: "すべての接続候補で失敗しました")
+                        self.notifyStateChange()
+                    }
+                }
+            } else {
+                // relay候補なし → 即失敗
+                self.isICEInProgress = false
+                Logger.p2p("❌ すべてのICE候補で失敗（relay候補なし）", level: .error)
+                self.state = .failed(reason: "すべての接続候補で失敗しました")
+                self.notifyStateChange()
+            }
+        }
     }
     
-    /// 次の候補を試行
-    private func tryNextCandidate(_ candidates: [ICECandidate], index: Int) {
+    /// ★ B-1: host/srflx候補を順次試行（.failedをnotifyしない）
+    private func tryDirectCandidates(_ candidates: [ICECandidate], index: Int, completion: @escaping (Bool) -> Void) {
         guard index < candidates.count else {
-            Logger.p2p("❌ すべてのICE候補で失敗", level: .error)
-            state = .failed(reason: "すべての接続候補で失敗しました")
-            notifyStateChange()
+            // ★ B-1: 全direct候補失敗 → .failedはnotifyせずcompletionのみ
+            Logger.p2p("⚠️ direct候補全失敗 (\(candidates.count)件)")
+            completion(false)
             return
         }
         
@@ -123,28 +170,31 @@ public class P2PConnectionManager {
         
         switch candidate.type {
         case .host:
-            // ローカル候補は直接接続
             attemptDirectConnectWithFallback(
                 ip: candidate.ip,
                 port: UInt16(candidate.port)
             ) { [weak self] success in
-                if !success {
-                    self?.tryNextCandidate(candidates, index: index + 1)
+                if success {
+                    self?.isICEInProgress = false
+                    completion(true)
+                } else {
+                    self?.tryDirectCandidates(candidates, index: index + 1, completion: completion)
                 }
             }
             
         case .serverReflexive:
-            // STUN候補はホールパンチング
             attemptHolePunch(ip: candidate.ip, port: UInt16(candidate.port)) { [weak self] success in
-                if !success {
-                    self?.tryNextCandidate(candidates, index: index + 1)
+                if success {
+                    self?.isICEInProgress = false
+                    completion(true)
+                } else {
+                    self?.tryDirectCandidates(candidates, index: index + 1, completion: completion)
                 }
             }
             
         case .relay:
-            // リレー候補（将来のCloudflare対応用）
-            Logger.p2p("⚠️ リレー候補は未実装、スキップ", level: .warning)
-            tryNextCandidate(candidates, index: index + 1)
+            // relay候補はここでは処理しない（connectWithICEのフォールバックで処理）
+            self.tryDirectCandidates(candidates, index: index + 1, completion: completion)
         }
     }
     
@@ -162,7 +212,8 @@ public class P2PConnectionManager {
         var hasCompleted = false
         
         // 短いタイムアウト（候補ごとに素早く試行）
-        let candidateTimeout: TimeInterval = 3.0
+        // ★ 高速化: 3.0s -> 1.5s
+        let candidateTimeout: TimeInterval = 1.5
         queue.asyncAfter(deadline: .now() + candidateTimeout) { [weak self] in
             guard !hasCompleted else { return }
             hasCompleted = true
@@ -221,9 +272,64 @@ public class P2PConnectionManager {
         connection = nil
         state = .idle
         notifyStateChange()
+        
+        // ★ Phase 1: TURN Allocation解放
+        if let tc = turnClient {
+            Task {
+                await tc.deallocate()
+            }
+            turnClient = nil
+        }
     }
     
     // MARK: - Private Methods
+    
+    /// ★ Phase 1: TURN リレー経由接続
+    private func attemptTURNRelay(relayIP: String, relayPort: UInt16, completion: @escaping (Bool) -> Void) {
+        Logger.p2p("🔄 TURN リレー接続開始...")
+        
+        Task {
+            do {
+                let client = TURNClient()
+                self.turnClient = client
+                
+                // 1. TURN Allocate（リレーアドレス取得）
+                let allocation = try await client.allocate()
+                Logger.p2p("✅ TURN Allocate成功: \(allocation.relayIP):\(allocation.relayPort)")
+                self.myRelayIP = allocation.relayIP
+                self.myRelayPort = UInt16(allocation.relayPort)
+                
+                // 2. macOSホスト側へのPermission作成
+                try await client.createPermission(for: relayIP, peerPort: relayPort)
+                Logger.p2p("✅ Permission作成成功")
+                
+                // 3. ChannelBind（効率的データ転送用）
+                let channel = try await client.channelBind(peerIP: relayIP, peerPort: relayPort)
+                Logger.p2p("✅ ChannelBind成功: ch=\(String(format: "0x%04X", channel))")
+                
+                // ★ B-3: セットアップ完了後にデータ受信ループを開始
+                // allocate()内で開始するとcreatePermission/channelBindのsendAndReceive()と競合するため
+                await client.startReceiving()
+                
+                // 4. 接続成功通知
+                DispatchQueue.main.async { [weak self] in
+                    // ★ 修正: endpointにはMac側のrelayアドレスを使用（allocation.relayIPはiPhone自身のrelay）
+                    self?.state = .connected(endpoint: "TURN:\(relayIP):\(relayPort)")
+                    self?.notifyStateChange()
+                    
+                    // NetworkReceiverに接続先を通知
+                    // TURN経由の場合、実際のデータはTURNClient経由で送受信される
+                    Logger.p2p("✅ TURN リレー接続確立完了")
+                    completion(true)
+                }
+            } catch {
+                Logger.p2p("❌ TURN リレー接続失敗: \(error.localizedDescription)", level: .error)
+                DispatchQueue.main.async {
+                    completion(false)
+                }
+            }
+        }
+    }
     
     /// ホールパンチング試行
     private func attemptHolePunch(ip: String, port: UInt16, completion: @escaping (Bool) -> Void) {
@@ -245,12 +351,12 @@ public class P2PConnectionManager {
         var hasCompleted = false
         
         // タイムアウト
+        // ★ B-1: .failedをnotifyしない（completion(false)で次候補に遷移）
         queue.asyncAfter(deadline: .now() + connectionTimeout) { [weak self] in
             guard !hasCompleted else { return }
             hasCompleted = true
             conn.cancel()
-            self?.state = .failed(reason: "タイムアウト")
-            self?.notifyStateChange()
+            Logger.p2p("⏱️ holePunchタイムアウト（次候補に遷移）")
             completion(false)
         }
         
@@ -401,8 +507,20 @@ public class P2PConnectionManager {
             self?.onStateChange?(currentState)
         }
     }
+    
+    // MARK: - Smart Connection Extensions
+    
+    /// 接続ハンドラを設定（RemoteViewModel互換用）
+    public func setConnectionHandler(_ handler: @escaping (P2PConnectionState) -> Void) {
+        self.onStateChange = handler
+    }
+    
+    /// ICE候補を使って接続開始（RemoteViewModel互換用）
+    // iPhone版は既存の connectWithICE があるが、引数や挙動が異なる可能性があるため調整
+    // 既存の connectWithICE(candidates:) は既に実装されている（96行目付近）
+    // しかし、RemoteViewModelは setConnectionHandler を使って状態監視しようとしている
+    // 既存実装では onStateChange を使うので、setConnectionHandler はそのエイリアスとして機能させる
 }
-
 // MARK: - P2P Errors
 
 public enum P2PError: Error, LocalizedError {

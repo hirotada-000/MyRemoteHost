@@ -62,7 +62,13 @@ class VideoEncoder {
     var peakBitRateMultiplier: Double = 1.2
     
     /// コーデック選択（HEVC = 高画質、H.264 = 互換性）
-    var codec: VideoCodec = .hevc
+    var codec: VideoCodec = .hevc {
+        didSet {
+            if oldValue != codec {
+                Logger.pipeline("★ エンコーダ コーデック変更: \(oldValue.rawValue) → \(codec.rawValue)", sampling: .always)
+            }
+        }
+    }
     
     // ★ 新規: 高画質テキストモード
     /// テキスト高画質モード（4:4:4 相当の高品質設定）
@@ -82,6 +88,14 @@ class VideoEncoder {
     private var height: Int32 = 0
     private var hasOutputParameterSets = false
     
+    /// ★ Phase 2: セッション準備状態（nonisolatedから安全にアクセス可能）
+    var isReady: Bool { compressionSession != nil }
+    
+    /// ★ Phase 2: プリウォーム済みセッション（裏で準備、アトミック切替）
+    private var pendingSession: VTCompressionSession?
+    private var pendingWidth: Int32 = 0
+    private var pendingHeight: Int32 = 0
+    
     /// パラメータセットログ済みフラグ（初回のみログ）
     private var hasLoggedParameterSets = false
     
@@ -95,7 +109,7 @@ class VideoEncoder {
         self.width = width
         self.height = height
         
-        // print("[VideoEncoder] セットアップ: \(width)x\(height)")
+        Logger.pipeline("★ エンコーダ セットアップ開始: \(width)x\(height) \(codec.rawValue)", sampling: .always)
         
         // 既存のセッションを破棄
         teardown()
@@ -137,13 +151,13 @@ class VideoEncoder {
         VTCompressionSessionPrepareToEncodeFrames(session)
         
         hasOutputParameterSets = false
-        // print("[VideoEncoder] セットアップ完了")
+        Logger.pipeline("✅ エンコーダ セットアップ完了: \(width)x\(height) \(codec.rawValue)", sampling: .always)
     }
     
     /// フレームをエンコード
     func encode(pixelBuffer: CVPixelBuffer, presentationTime: CMTime, duration: CMTime) {
         guard let session = compressionSession else {
-            // print("[VideoEncoder] セッションが初期化されていません")
+            Logger.pipeline("⚠️ エンコード失敗: セッション未初期化", level: .warning, sampling: .throttle(3.0))
             return
         }
         
@@ -168,7 +182,7 @@ class VideoEncoder {
         }
         
         if status != noErr {
-            // print("[VideoEncoder] エンコードエラー: \(status)")
+            Logger.pipeline("❌ エンコードエラー: status=\(status)", level: .error, sampling: .throttle(3.0))
         }
     }
     
@@ -178,16 +192,129 @@ class VideoEncoder {
     /// 強制キーフレームをリクエスト
     func forceKeyFrame() {
         forceNextKeyFrame = true
-        // print("[VideoEncoder] キーフレームをリクエスト")
+        Logger.pipeline("★ キーフレーム強制リクエスト", sampling: .always)
     }
     
     /// エンコーダーをクリーンアップ
     func teardown() {
+        Logger.pipeline("★ エンコーダ teardown開始 (session=\(compressionSession != nil), pending=\(pendingSession != nil))", sampling: .always)
         if let session = compressionSession {
             VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
             VTCompressionSessionInvalidate(session)
             compressionSession = nil
-            // print("[VideoEncoder] セッション破棄")
+        }
+        // プリウォームセッションも破棄
+        if let pending = pendingSession {
+            VTCompressionSessionInvalidate(pending)
+            pendingSession = nil
+        }
+        Logger.pipeline("★ エンコーダ teardown完了", sampling: .always)
+    }
+    
+    // MARK: - ★ Phase 2: プリウォーム（エンコーダ再構成のフリーズ解消）
+    
+    /// 新しいセッションを裏で準備（コーデック/解像度変更時に事前呼び出し）
+    func prewarmSession(width: Int32, height: Int32) {
+        // 同じ解像度ならスキップ
+        guard width != self.width || height != self.height else { return }
+        
+        let codecType: CMVideoCodecType = (codec == .hevc)
+            ? kCMVideoCodecType_HEVC
+            : kCMVideoCodecType_H264
+        
+        let encoderSpecification: [CFString: Any] = [
+            kVTVideoEncoderSpecification_EnableLowLatencyRateControl: true
+        ]
+        
+        var newSession: VTCompressionSession?
+        let status = VTCompressionSessionCreate(
+            allocator: kCFAllocatorDefault,
+            width: width,
+            height: height,
+            codecType: codecType,
+            encoderSpecification: encoderSpecification as CFDictionary,
+            imageBufferAttributes: nil,
+            compressedDataAllocator: nil,
+            outputCallback: nil,
+            refcon: nil,
+            compressionSessionOut: &newSession
+        )
+        
+        guard status == noErr, let session = newSession else {
+            Logger.pipeline("⚠️ プリウォーム失敗: \(status)", level: .warning, sampling: .always)
+            return
+        }
+        
+        do {
+            try configureSession(session)
+            VTCompressionSessionPrepareToEncodeFrames(session)
+            
+            // 古いプリウォームを破棄
+            if let old = pendingSession {
+                VTCompressionSessionInvalidate(old)
+            }
+            pendingSession = session
+            pendingWidth = width
+            pendingHeight = height
+            Logger.pipeline("★ プリウォーム完了: \(width)x\(height)", sampling: .always)
+        } catch {
+            VTCompressionSessionInvalidate(session)
+            Logger.pipeline("⚠️ プリウォーム設定失敗: \(error)", level: .warning, sampling: .always)
+        }
+    }
+    
+    /// プリウォーム済みセッションにアトミック切替（フレームドロップなし）
+    func swapToPrewarmedSession() -> Bool {
+        guard let newSession = pendingSession else { return false }
+        
+        // 旧セッションを破棄
+        if let oldSession = compressionSession {
+            VTCompressionSessionCompleteFrames(oldSession, untilPresentationTimeStamp: .invalid)
+            VTCompressionSessionInvalidate(oldSession)
+        }
+        
+        // アトミック切替
+        compressionSession = newSession
+        width = pendingWidth
+        height = pendingHeight
+        pendingSession = nil
+        hasOutputParameterSets = false
+        
+        Logger.pipeline("★ セッション切替完了: \(width)x\(height)", sampling: .always)
+        return true
+    }
+    
+    // MARK: - ★ 最適化 4-A: セッション再作成なしのパラメータ即時更新
+    
+    /// セッション再作成なしでパラメータを即時更新（ビットレート/品質/FPS/KF間隔のみ）
+    /// 解像度・コーデック変更時はsetup()またはprewarmSession()を使用
+    func updateRuntimeParameters(bitRate newBitRate: Int? = nil,
+                                  quality newQuality: Float? = nil,
+                                  fps newFPS: Int? = nil,
+                                  keyFrameInterval newKFInterval: Int? = nil) {
+        guard let session = compressionSession else { return }
+        
+        if let br = newBitRate, br != bitRate {
+            bitRate = br
+            VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: br as CFNumber)
+            let peak = Int(Double(br) * peakBitRateMultiplier)
+            let limits = [peak, 1] as CFArray
+            VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: limits)
+        }
+        
+        if let q = newQuality, q != qualityValue {
+            qualityValue = q
+            VTSessionSetProperty(session, key: kVTCompressionPropertyKey_Quality, value: q as CFNumber)
+        }
+        
+        if let f = newFPS, f != targetFrameRate {
+            targetFrameRate = f
+            VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: f as CFNumber)
+        }
+        
+        if let kf = newKFInterval, kf != maxKeyFrameInterval {
+            maxKeyFrameInterval = kf
+            VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: kf as CFNumber)
         }
     }
     
@@ -459,10 +586,15 @@ class VideoEncoder {
         let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         
         // キーフレーム判定
+        // Apple VideoToolbox: kCMSampleAttachmentKey_NotSync
+        //   - 存在しない or false → 同期フレーム（キーフレーム）
+        //   - true → 非同期フレーム（P-frame）
         var isKeyFrame = false
         if let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]],
            let attachment = attachments.first {
-            isKeyFrame = !(attachment[kCMSampleAttachmentKey_NotSync] as? Bool ?? true)
+            // ★ 修正: NotSync が nil（存在しない）= キーフレーム → デフォルト false
+            let notSync = attachment[kCMSampleAttachmentKey_NotSync] as? Bool ?? false
+            isKeyFrame = !notSync
         }
         
         // データ取得

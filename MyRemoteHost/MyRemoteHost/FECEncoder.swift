@@ -145,34 +145,86 @@ class FECEncoder {
         return parityBlocks
     }
     
-    /// XORパリティを生成 (シンプル版)
+    /// XORパリティを生成 (シンプル版 — UInt64最適化)
     private func generateXORParity(data: Data, size: Int) -> Data {
         var parity = Data(repeating: 0, count: size)
         
-        for i in 0..<data.count {
-            let parityIndex = i % size
-            parity[parityIndex] ^= data[i]
+        // UInt64で8バイトずつ処理
+        let fullChunks = data.count / size  // 完全に1周するチャンク数
+        let remainder = data.count % size
+        
+        data.withUnsafeBytes { dataPtr in
+            parity.withUnsafeMutableBytes { parityPtr in
+                guard let dBase = dataPtr.baseAddress,
+                      let pBase = parityPtr.baseAddress else { return }
+                
+                // 各完全チャンクでパリティにXOR
+                for chunk in 0..<fullChunks {
+                    let offset = chunk * size
+                    let words = size / 8
+                    let wordRemainder = size % 8
+                    
+                    let src = dBase.advanced(by: offset).assumingMemoryBound(to: UInt64.self)
+                    let dst = pBase.assumingMemoryBound(to: UInt64.self)
+                    
+                    for w in 0..<words {
+                        dst[w] ^= src[w]
+                    }
+                    
+                    // 残りバイト
+                    let srcBytes = dBase.advanced(by: offset).assumingMemoryBound(to: UInt8.self)
+                    let dstBytes = pBase.assumingMemoryBound(to: UInt8.self)
+                    for b in (words * 8)..<size {
+                        dstBytes[b] ^= srcBytes[b]
+                    }
+                }
+                
+                // 残余データ（size未満の端数）
+                if remainder > 0 {
+                    let offset = fullChunks * size
+                    let srcBytes = dBase.advanced(by: offset).assumingMemoryBound(to: UInt8.self)
+                    let dstBytes = pBase.assumingMemoryBound(to: UInt8.self)
+                    for b in 0..<remainder {
+                        dstBytes[b] ^= srcBytes[b]
+                    }
+                }
+            }
         }
         
         return parity
     }
     
-    /// 2つのDataをXOR
+    /// 2つのDataをXOR (UInt64最適化)
     private func xor(_ a: Data, _ b: Data) -> Data {
         let length = min(a.count, b.count)
         var result = Data(count: length)
         
+        let words = length / 8
+        let wordRemainder = length % 8
+        
         a.withUnsafeBytes { aPtr in
             b.withUnsafeBytes { bPtr in
                 result.withUnsafeMutableBytes { rPtr in
-                    guard let aBase = aPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
-                          let bBase = bPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
-                          let rBase = rPtr.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
-                        return
+                    guard let aBase = aPtr.baseAddress,
+                          let bBase = bPtr.baseAddress,
+                          let rBase = rPtr.baseAddress else { return }
+                    
+                    // UInt64で8バイトずつXOR
+                    let aSrc = aBase.assumingMemoryBound(to: UInt64.self)
+                    let bSrc = bBase.assumingMemoryBound(to: UInt64.self)
+                    let dst = rBase.assumingMemoryBound(to: UInt64.self)
+                    
+                    for i in 0..<words {
+                        dst[i] = aSrc[i] ^ bSrc[i]
                     }
                     
-                    for i in 0..<length {
-                        rBase[i] = aBase[i] ^ bBase[i]
+                    // 残りバイト
+                    let aBytes = aBase.assumingMemoryBound(to: UInt8.self)
+                    let bBytes = bBase.assumingMemoryBound(to: UInt8.self)
+                    let rBytes = rBase.assumingMemoryBound(to: UInt8.self)
+                    
+                    for i in (words * 8)..<length {
+                        rBytes[i] = aBytes[i] ^ bBytes[i]
                     }
                 }
             }

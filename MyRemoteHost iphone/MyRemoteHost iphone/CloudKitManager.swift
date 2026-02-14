@@ -51,6 +51,17 @@ actor CloudKitManager {
         return userID
     }
     
+    /// userRecordIDが一致するか確認
+    func isSameAppleID(as otherUserRecordID: String) async -> Bool {
+        do {
+            let myID = try await fetchUserRecordID()
+            return myID == otherUserRecordID
+        } catch {
+            print("[CloudKitManager] Apple ID比較失敗: \(error)")
+            return false
+        }
+    }
+    
     /// キャッシュをクリア
     func clearCache() {
         cachedUserRecordID = nil

@@ -18,7 +18,7 @@ class MetalDirectRenderer {
     // MARK: - Metal Objects
     
     private let device: MTLDevice
-    private let commandQueue: MTLCommandQueue
+    let commandQueue: MTLCommandQueue
     private var textureCache: CVMetalTextureCache?
     private var pipelineState: MTLRenderPipelineState?
     
@@ -329,12 +329,11 @@ class ProMotionSyncRenderer {
         self.metalRenderer = renderer
         self.metalLayer = metalLayer
         
-        guard let device = MTLCreateSystemDefaultDevice(),
-              let queue = device.makeCommandQueue() else { return nil }
-        self.commandQueue = queue
+        // ★ MetalDirectRendererのデバイスとコマンドキューを再利用（GPU初期化の二重コスト排除）
+        self.commandQueue = renderer.commandQueue
         
-        // Metal Layer 設定
-        metalLayer.device = device
+        // Metal Layer 設定（共有デバイスを使用）
+        metalLayer.device = renderer.commandQueue.device
         metalLayer.pixelFormat = .bgra8Unorm
         metalLayer.framebufferOnly = true
         // Note: displaySyncEnabled は macOS のみで利用可能（iOSでは自動VSync）
@@ -342,7 +341,7 @@ class ProMotionSyncRenderer {
         // ★ トリプルバッファリング無効化（遅延削減）
         metalLayer.maximumDrawableCount = 2
         
-        print("[ProMotionSync] ✅ 初期化完了")
+        print("[ProMotionSync] ✅ 初期化完了（Metalデバイス共有）")
     }
     
     /// 120Hz ProMotion 同期開始
